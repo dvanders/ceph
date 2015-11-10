@@ -4722,12 +4722,12 @@ TEST_F(LibRadosTwoPoolsECPP, HitSetTrim) {
 
 TEST_F(LibRadosTwoPoolsECPP, PromoteOn2ndRead) {
   // create object
-  {
+  for (int i=0; i<20; ++i) {
     bufferlist bl;
     bl.append("hi there");
     ObjectWriteOperation op;
     op.write_full(bl);
-    ASSERT_EQ(0, ioctx.operate("foo", &op));
+    ASSERT_EQ(0, ioctx.operate("foo" + stringify(i), &op));
   }
 
   // configure cache
