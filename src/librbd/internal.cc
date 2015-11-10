@@ -2097,7 +2097,6 @@ reprotect_and_return_err:
     int r = ictx_check(ictx);
     if (r < 0)
       return r;
-    bufferlist bl, bl2;
 
     RWLock::RLocker l(ictx->snap_lock);
     for (map<snap_t, SnapInfo>::iterator it = ictx->snap_info.begin();
@@ -2329,7 +2328,6 @@ reprotect_and_return_err:
     RWLock::WLocker md_locker(ictx->md_lock);
 
     CephContext *cct = ictx->cct;
-    bufferlist bl, bl2;
 
     ldout(cct, 20) << "ictx_refresh " << ictx << dendl;
 
@@ -2884,7 +2882,8 @@ reprotect_and_return_err:
     if (ictx->object_cacher) {
       r = ictx->shutdown_cache(); // implicitly flushes
     } else {
-      r = flush(ictx);
+      RWLock::RLocker owner_locker(ictx->owner_lock);
+      r = _flush(ictx);
     }
     if (r < 0) {
       lderr(ictx->cct) << "error flushing IO: " << cpp_strerror(r)
@@ -3617,6 +3616,7 @@ reprotect_and_return_err:
     RWLock::RLocker owner_locker(ictx->owner_lock);
     RWLock::WLocker md_locker(ictx->md_lock);
     r = ictx->invalidate_cache();
+    ictx->perfcounter->inc(l_librbd_invalidate_cache);
     return r;
   }
 
