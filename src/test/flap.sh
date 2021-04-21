@@ -61,4 +61,43 @@ function TEST_flap() {
     ceph pg debug degraded_pgs_exist | grep -q FALSE
 }
 
+function TEST_flap_ec() {
+    local dir=$1
+
+    run_mon $dir a
+    run_mgr $dir x
+    run_osd $dir 0
+    run_osd $dir 1
+    run_osd $dir 2
+    run_osd $dir 3
+    run_osd $dir 4
+
+    ceph osd erasure-code-profile set myprofile k=2 m=2 crush-failure-domain=osd
+    ceph osd pool create foo 64 erasure myprofile
+    wait_for_clean
+
+    # write lots of objects
+    rados -p foo bench 30 write -b 4096 --no-cleanup
+    wait_for_clean
+
+    # set norebalance so that we don't backfill
+    ceph osd set norebalance
+    wait_for_clean
+
+    # flap an osd, it should repeer and come back clean
+    ceph osd down 0
+    wait_for_clean
+
+    # drain osd.0, then wait for peering
+    ceph osd crush reweight osd.0 0
+    wait_for_peered
+
+    # flap osd.0 while draining, this has been known to incorrectly degrade pgs
+    ceph osd down 0
+    wait_for_osd up 0
+    wait_for_peered
+
+    # now there should be zero undersized or degraded pgs
+    ceph pg debug degraded_pgs_exist | grep -q FALSE
+}
 main flap "$@"
