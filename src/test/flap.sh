@@ -99,5 +99,27 @@ function TEST_flap_ec() {
 
     # now there should be zero undersized or degraded pgs
     ceph pg debug degraded_pgs_exist | grep -q FALSE
+
+    # set norebalance so that we don't backfill
+    ceph osd set norebalance
+    wait_for_clean
+
+    # add new OSDs
+    run_osd $dir 5
+    run_osd $dir 6
+    wait_for_peered # wait_for_clean??
+
+    # We now have old osds=0,...,4 and
+    # new OSDs 5,6. Flapping an old osd leads to degraded objects.
+    # flap osd.0 while rebalancing
+    ceph osd unset norebalance
+    sleep 10 # let rebalancing progress a bit
+    ceph osd down 0
+    wait_for_osd up 0
+    wait_for_peered
+
+    # now there should be zero undersized or degraded pgs
+    # I don't recall if I saw degraded PGs or only degraded objects.
+    ceph pg debug degraded_pgs_exist | grep -q FALSE
 }
 main flap "$@"
