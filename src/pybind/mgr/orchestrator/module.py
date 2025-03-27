@@ -360,7 +360,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule,
         Option(
             'fail_fs',
             type='bool',
-            default=False,
+            default=True,
             desc='Fail filesystem for rapid multi-rank mds upgrade'
         ),
     ]

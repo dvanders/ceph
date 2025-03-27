@@ -63,7 +63,7 @@ class UpgradeState:
                  target_version: Optional[str] = None,
                  error: Optional[str] = None,
                  paused: Optional[bool] = None,
-                 fail_fs: bool = False,
+                 fail_fs: bool = True,
                  fs_original_max_mds: Optional[Dict[str, int]] = None,
                  fs_original_allow_standby_replay: Optional[Dict[str, bool]] = None,
                  daemon_types: Optional[List[str]] = None,
