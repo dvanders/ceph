@@ -4,7 +4,7 @@ The classes defined here provide the SMART disk failure prediction module.
 CLYSODiskFailurePredictor uses a rule-based model developed by CLYSO.
 
 To predict hard drive health and deduce time to failure, the
-predict function is called with 6 days worth of SMART data from the hard drive.
+predict function is called with a few days worth of SMART data from the device.
 It will return a string to indicate disk failure status: "Good", "Warning",
 "Bad", or "Unknown".
 """

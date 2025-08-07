@@ -135,7 +135,7 @@ class Module(MgrModule):
             self.log.error('invalid value received for MODULE_OPTIONS.predictor_heuristic')
             return predicted_result
 
-        if len(health_data) >= 6:
+        if len(health_data) >= 1:
             o_keys = sorted(health_data.keys(), reverse=True)
             for o_key in o_keys:
                 # get values for current day (?)
@@ -202,12 +202,12 @@ class Module(MgrModule):
                 # if smart data was found, then add that to list
                 if dev_smart:
                     predict_datas.append(dev_smart)
-                if len(predict_datas) >= 12:
+                if len(predict_datas) >= 5:
                     break
         else:
             self.log.error('unable to predict device due to health data records less than 6 days')
 
-        if len(predict_datas) >= 6:
+        if len(predict_datas) >= 1:
             predicted_result = obj_predictor.predict(predict_datas)
         return predicted_result
 
