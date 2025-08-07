@@ -119,14 +119,14 @@ class Module(MgrModule):
         ),
         Option(
             name='mark_out_threshold',
-            default=(86400 * 14 * 2),
+            default=(86400 * 7 * 2), # 2 weeks, i.e. Bad
             type='secs',
             desc='automatically mark OSD if it may fail before this long',
             runtime=True,
         ),
         Option(
             name='warn_threshold',
-            default=(86400 * 14 * 6),
+            default=(86400 * 7 * 6), # 6 weeks, i.e. Warning
             type='secs',
             desc='raise health warning if OSD may fail before this long',
             runtime=True,
@@ -661,8 +661,8 @@ class Module(MgrModule):
                     % (dev['devid'],
                        ','.join(device_locations),
                        ','.join(dev.get('daemons', ['none'])),
-                       dev['life_expectancy_max'],
-                       dev.get('life_expectancy_max', 'unknown')))
+                       dev.get('life_expectancy_min', 'unknown'),
+                       dev['life_expectancy_max']))
 
         # OSD might be marked 'out' (which means it has no
         # data), however PGs are still attached to it.
