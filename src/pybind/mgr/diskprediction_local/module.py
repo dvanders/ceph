@@ -178,6 +178,11 @@ class Module(MgrModule):
                     if attr.get('value') is not None:
                         dev_smart['smart_%s_normalized' % attr.get('id')] = \
                             attr.get('value')
+                    # get threshold smart values
+                    if attr.get('thresh') is not None:
+                        dev_smart['smart_%s_threshold' % attr.get('id')] = \
+                            attr.get('thresh')
+
                 # add power on hours manually if not available in smart attributes
                 power_on_time = s_val.get('power_on_time', {}).get('hours')
                 if power_on_time is not None:
@@ -196,6 +201,24 @@ class Module(MgrModule):
                 vendor = s_val.get('vendor')
                 if vendor is not None:
                     dev_smart['vendor'] = vendor
+
+                # add smart_status
+                smart_status = s_val.get('smart_status', {}).get('passed')
+                if smart_status is not None:
+                    dev_smart['smart_status'] = smart_status
+
+                # add useful nvme_smart_health_information_log
+                nvme_smart = s_val.get('nvme_smart_health_information_log', {})
+                if nvme_smart:
+                    dev_smart['nvme_critical_warning'] = \
+                        nvme_smart.get('critical_warning', 0)
+                    dev_smart['nvme_available_spare'] = \
+                        nvme_smart.get('available_spare', 100)
+                    dev_smart['nvme_available_spare_threshold'] = \
+                        nvme_smart.get('available_spare_threshold', 10)
+                    dev_smart['nvme_percentage_used'] = \
+                        nvme_smart.get('percentage_used', 0)
+
                 # if smart data was found, then add that to list
                 if dev_smart:
                     predict_datas.append(dev_smart)
@@ -271,13 +294,13 @@ class Module(MgrModule):
                 continue
             predicted = int(time.time() * (1000 ** 3))
 
-            if result.lower() == 'good':
+            if result.lower() == 'good': # 6 weeks plus 1 day
                 life_expectancy_day_min = (TIME_WEEK * 6) + TIME_DAYS
                 life_expectancy_day_max = 0
-            elif result.lower() == 'warning':
+            elif result.lower() == 'warning': # 2 to 6 weeks
                 life_expectancy_day_min = (TIME_WEEK * 2)
                 life_expectancy_day_max = (TIME_WEEK * 6)
-            elif result.lower() == 'bad':
+            elif result.lower() == 'bad': # 0 to 13 days
                 life_expectancy_day_min = 0
                 life_expectancy_day_max = (TIME_WEEK * 2) - TIME_DAYS
             else:
