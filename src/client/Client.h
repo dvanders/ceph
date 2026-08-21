@@ -2190,6 +2190,7 @@ private:
   int _flock(Fh *fh, int cmd, uint64_t owner);
   int _lazyio(Fh *fh, int enable);
   int _lazyio_synchronize(Inode *in, const UserPerm& perms);
+  bool _is_close_to_open(int flags) const;
 
   Dentry *get_or_create(Inode *dir, const std::string& name);
 
@@ -2422,6 +2423,7 @@ private:
 
   bool is_fuse = false;
   bool client_permissions;
+  bool close_to_open;
   bool fuse_default_permissions;
   bool respect_subvolume_snapshot_visibility;
 
