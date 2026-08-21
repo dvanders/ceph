@@ -13761,6 +13761,22 @@ int Client::_do_filelock(Inode *in, Fh *fh, int lock_type, int op, int sleep,
   if (op != CEPH_MDS_OP_SETFILELOCK || lock_cmd == CEPH_LOCK_UNLOCK)
     sleep = 0;
 
+  bool cto_lock = fh->close_to_open && !removing &&
+		  op == CEPH_MDS_OP_SETFILELOCK;
+
+  /*
+   * A close-to-open client owes the next holder of the lock whatever it wrote
+   * while holding it, just like it owes the next opener whatever it wrote
+   * before the close.  Flush before the lock is gone; NFS does the same.
+   */
+  if (cto_lock && lock_cmd == CEPH_LOCK_UNLOCK) {
+    int r = _fsync(in, false);
+    if (r < 0)
+      ldout(cct, 1) << __func__ << " ino " << in->ino
+		    << " failed to flush before unlock: " << cpp_strerror(r)
+		    << dendl;
+  }
+
   /*
    * Set the most significant bit, so that MDS knows the 'owner'
    * is sufficient to identify the owner of lock. (old code uses
@@ -13848,6 +13864,23 @@ int Client::_do_filelock(Inode *in, Fh *fh, int lock_type, int op, int sleep,
     } else
       ceph_abort();
   }
+
+  /*
+   * Taking a lock is the other point where a close-to-open client has to
+   * catch up with the rest of the cluster: whoever held the lock before us
+   * may have written the file while we were caching it on Fl alone.  Keep the
+   * lock even if that fails - the error is reported by close() or fsync() -
+   * but leave the cache marked so that it gets another chance later on.
+   */
+  if (ret == 0 && cto_lock && lock_cmd != CEPH_LOCK_UNLOCK &&
+      in->lazyio_cache_stale) {
+    int r = _lazyio_synchronize(in, fh->actor_perms);
+    if (r < 0)
+      ldout(cct, 1) << __func__ << " ino " << in->ino
+		    << " failed to revalidate after lock: " << cpp_strerror(r)
+		    << dendl;
+  }
+
   return ret;
 }
 
