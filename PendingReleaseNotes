@@ -30,6 +30,14 @@
   a few times in random workloads.  ``mds_dir_prefetch_backend_max`` (default 1)
   limits the number of concurrent background fetches.  This reduces latency in
   large directories while retaining cache warmth for hot directories.
+* CephFS: libcephfs and ceph-fuse can now be configured to provide close-to-open
+  consistency for file data, the model that NFS uses, with the new
+  ``client_close_to_open`` option.  Clients keep caching a file that is being
+  written by another client, flush before ``close()`` returns, and revalidate on
+  ``open()``, on advisory locking and after ``client_close_to_open_timeout``.
+  Metadata consistency is unchanged.  Applications that write overlapping regions
+  of a shared file at the same time must not use it.  See the LazyIO section of
+  the documentation.
 
 * CephFS: The ``client_force_lazyio`` configuration option is now correctly marked
   as not supporting runtime updates. Previously, the configuration schema indicated
