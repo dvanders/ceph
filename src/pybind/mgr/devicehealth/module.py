@@ -762,8 +762,10 @@ class Module(MgrModule):
         model = self.get_ceph_option('device_failure_prediction_mode')
         if cast(str, model).lower() == 'local':
             plugin_name = 'diskprediction_local'
+        elif cast(str, model).lower() == 'smart':
+            plugin_name = 'diskprediction_smart'
         else:
-            return -1, '', 'unable to enable any disk prediction model[local/cloud]'
+            return -1, '', 'unable to enable any disk prediction model[local/smart]'
         try:
             can_run, _ = self.remote(plugin_name, 'can_run')
             if can_run:
@@ -778,8 +780,10 @@ class Module(MgrModule):
         model = self.get_ceph_option('device_failure_prediction_mode')
         if cast(str, model).lower() == 'local':
             plugin_name = 'diskprediction_local'
+        elif cast(str, model).lower() == 'smart':
+            plugin_name = 'diskprediction_smart'
         else:
-            return -1, '', 'unable to enable any disk prediction model[local/cloud]'
+            return -1, '', 'unable to enable any disk prediction model[local/smart]'
         try:
             can_run, _ = self.remote(plugin_name, 'can_run')
             if can_run:

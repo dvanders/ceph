@@ -1,5 +1,5 @@
 """
-diskprediction with local predictor
+diskprediction with SMART predictor
 """
 import json
 import datetime
@@ -7,16 +7,7 @@ from threading import Event
 import time
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 from mgr_module import CommandResult, MgrModule, Option
-
-from .cli import DiskpredictionLocalCLICommand
-# Importing scipy early appears to avoid a future deadlock when
-# we try to do
-#
-#  from .predictor import get_diskfailurepredictor_path
-#
-# in a command thread.  See https://tracker.ceph.com/issues/42764
-import scipy  # noqa: ignore=F401
-from .predictor import DevSmartT, Predictor, get_diskfailurepredictor_path
+from .predictor import DevSmartT, Predictor
 
 
 TIME_FORMAT = '%Y%m%d-%H%M%S'
@@ -25,14 +16,13 @@ TIME_WEEK = TIME_DAYS * 7
 
 
 class Module(MgrModule):
-    CLICommand = DiskpredictionLocalCLICommand
     MODULE_OPTIONS = [
         Option(name='sleep_interval',
                default=600),
         Option(name='predict_interval',
                default=86400),
-        Option(name='predictor_model',
-               default='prophetstor')
+        Option(name='predictor_heuristic',
+               default='clyso')
     ]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -47,7 +37,7 @@ class Module(MgrModule):
         if TYPE_CHECKING:
             self.sleep_interval = 0
             self.predict_interval = 0
-            self.predictor_model = ''
+            self.predictor_heuristic = ''
 
     def config_notify(self) -> None:
         for opt in self.MODULE_OPTIONS:
@@ -55,7 +45,7 @@ class Module(MgrModule):
                     opt['name'],
                     self.get_module_option(opt['name']))
             self.log.debug(' %s = %s', opt['name'], getattr(self, opt['name']))
-        if self.get_ceph_option('device_failure_prediction_mode') == 'local':
+        if self.get_ceph_option('device_failure_prediction_mode') == 'smart':
             self._event.set()
 
     def refresh_config(self) -> None:
@@ -71,7 +61,7 @@ class Module(MgrModule):
         assert ret == 0
 
     def serve(self) -> None:
-        self.log.info('Starting diskprediction local module')
+        self.log.info('Starting diskprediction_smart module')
         self.config_notify()
         last_predicted = None
         ls = self.get_store('last_predicted')
@@ -85,7 +75,7 @@ class Module(MgrModule):
         while self._run:
             self.refresh_config()
             mode = self.get_ceph_option('device_failure_prediction_mode')
-            if mode == 'local':
+            if mode == 'smart':
                 now = datetime.datetime.utcnow()
                 if not last_predicted:
                     next_predicted = now
@@ -139,16 +129,10 @@ class Module(MgrModule):
         except Exception as e:
             self.log.error('failed to get device %s health data due to %s', devid, str(e))
 
-        # initialize appropriate disk failure predictor model
-        obj_predictor = Predictor.create(self.predictor_model)
+        # initialize appropriate disk failure predictor heuristic
+        obj_predictor = Predictor.create(self.predictor_heuristic)
         if obj_predictor is None:
-            self.log.error('invalid value received for MODULE_OPTIONS.predictor_model')
-            return predicted_result
-        try:
-            obj_predictor.initialize(
-                "{}/models/{}".format(get_diskfailurepredictor_path(), self.predictor_model))
-        except Exception as e:
-            self.log.error('Error initializing predictor: %s', e)
+            self.log.error('invalid value received for MODULE_OPTIONS.predictor_heuristic')
             return predicted_result
 
         if len(health_data) >= 6:
@@ -178,6 +162,11 @@ class Module(MgrModule):
                     if attr.get('value') is not None:
                         dev_smart['smart_%s_normalized' % attr.get('id')] = \
                             attr.get('value')
+                    # get threshold smart values
+                    if attr.get('thresh') is not None:
+                        dev_smart['smart_%s_threshold' % attr.get('id')] = \
+                            attr.get('thresh')
+
                 # add power on hours manually if not available in smart attributes
                 power_on_time = s_val.get('power_on_time', {}).get('hours')
                 if power_on_time is not None:
@@ -192,10 +181,24 @@ class Module(MgrModule):
                 model_name = s_val.get('model_name')
                 if model_name is not None:
                     dev_smart['model_name'] = model_name
-                # add vendor
-                vendor = s_val.get('vendor')
-                if vendor is not None:
-                    dev_smart['vendor'] = vendor
+
+                # add smart_status
+                smart_status = s_val.get('smart_status', {}).get('passed')
+                if smart_status is not None:
+                    dev_smart['smart_status'] = smart_status
+
+                # add useful nvme_smart_health_information_log
+                nvme_smart = s_val.get('nvme_smart_health_information_log', {})
+                if nvme_smart:
+                    dev_smart['nvme_critical_warning'] = \
+                        nvme_smart.get('critical_warning', 0)
+                    dev_smart['nvme_available_spare'] = \
+                        nvme_smart.get('available_spare', 100)
+                    dev_smart['nvme_available_spare_threshold'] = \
+                        nvme_smart.get('available_spare_threshold', 10)
+                    dev_smart['nvme_percentage_used'] = \
+                        nvme_smart.get('percentage_used', 0)
+
                 # if smart data was found, then add that to list
                 if dev_smart:
                     predict_datas.append(dev_smart)
@@ -271,13 +274,13 @@ class Module(MgrModule):
                 continue
             predicted = int(time.time() * (1000 ** 3))
 
-            if result.lower() == 'good':
+            if result.lower() == 'good': # 6 weeks plus 1 day
                 life_expectancy_day_min = (TIME_WEEK * 6) + TIME_DAYS
                 life_expectancy_day_max = 0
-            elif result.lower() == 'warning':
+            elif result.lower() == 'warning': # 2 to 6 weeks
                 life_expectancy_day_min = (TIME_WEEK * 2)
                 life_expectancy_day_max = (TIME_WEEK * 6)
-            elif result.lower() == 'bad':
+            elif result.lower() == 'bad': # 0 to 13 days
                 life_expectancy_day_min = 0
                 life_expectancy_day_max = (TIME_WEEK * 2) - TIME_DAYS
             else:

@@ -2319,6 +2319,7 @@ fi
 %{_datadir}/ceph/mgr/balancer
 %{_datadir}/ceph/mgr/crash
 %{_datadir}/ceph/mgr/devicehealth
+%{_datadir}/ceph/mgr/diskprediction_smart
 %{_datadir}/ceph/mgr/orchestrator
 %{_datadir}/ceph/mgr/pg_autoscaler
 %{_datadir}/ceph/mgr/progress

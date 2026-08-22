@@ -69,6 +69,9 @@ class TestModuleSelftest(MgrTestCase):
                           'diskprediction_local')
         self._selftest_plugin("diskprediction_local")
 
+    def test_diskprediction_smart(self):
+        self._selftest_plugin("diskprediction_smart")
+
     def test_telegraf(self):
         self._selftest_plugin("telegraf")
 

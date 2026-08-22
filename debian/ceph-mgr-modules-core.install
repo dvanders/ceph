@@ -1,6 +1,7 @@
 usr/share/ceph/mgr/balancer
 usr/share/ceph/mgr/crash
 usr/share/ceph/mgr/devicehealth
+usr/share/ceph/mgr/diskprediction_smart
 usr/share/ceph/mgr/orchestrator
 usr/share/ceph/mgr/pg_autoscaler
 usr/share/ceph/mgr/progress

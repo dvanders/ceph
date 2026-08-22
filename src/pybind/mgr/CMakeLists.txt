@@ -28,6 +28,7 @@ set(mgr_modules
   # dashboard (optional)
   devicehealth
   diskprediction_local
+  diskprediction_smart
   # hello is an example for developers, not for user
   nvmeof
   influx

@@ -6938,14 +6938,13 @@ options:
   type: str
   level: basic
   desc: Method used to predict device failures
-  long_desc: To disable prediction, use 'none',  'local' uses a prediction model that
-    runs inside the mgr daemon.  'cloud' will share metrics with a cloud service and
-    query the service for devicelife expectancy.
+  long_desc: Use 'smart' to enable SMART-based prediction, 'local' to enable
+    a local ML-based prediction model, or 'none' to disable prediction.
   default: none
   enum_values:
   - none
   - local
-  - cloud
+  - smart
   flags:
   - runtime
 - name: gss_ktab_client_file
