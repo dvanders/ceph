@@ -661,8 +661,8 @@ class Module(MgrModule):
                     % (dev['devid'],
                        ','.join(device_locations),
                        ','.join(dev.get('daemons', ['none'])),
-                       dev['life_expectancy_max'],
-                       dev.get('life_expectancy_max', 'unknown')))
+                       dev.get('life_expectancy_min', 'unknown'),
+                       dev['life_expectancy_max']))
 
         # OSD might be marked 'out' (which means it has no
         # data), however PGs are still attached to it.
