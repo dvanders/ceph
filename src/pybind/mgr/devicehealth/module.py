@@ -119,14 +119,14 @@ class Module(MgrModule):
         ),
         Option(
             name='mark_out_threshold',
-            default=(86400 * 14 * 2),
+            default=(86400 * 7 * 2),  # 2 weeks
             type='secs',
             desc='automatically mark OSD if it may fail before this long',
             runtime=True,
         ),
         Option(
             name='warn_threshold',
-            default=(86400 * 14 * 6),
+            default=(86400 * 7 * 6),  # 6 weeks
             type='secs',
             desc='raise health warning if OSD may fail before this long',
             runtime=True,

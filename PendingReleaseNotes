@@ -30,6 +30,10 @@
   a few times in random workloads.  ``mds_dir_prefetch_backend_max`` (default 1)
   limits the number of concurrent background fetches.  This reduces latency in
   large directories while retaining cache warmth for hot directories.
+* MGR: The ``mgr/devicehealth/mark_out_threshold`` and
+  ``mgr/devicehealth/warn_threshold`` defaults are now 14 and 42 days (were 28
+  and 84), matching the two- and six-week bands the failure predictors report.
+  Set them explicitly to keep the old values.
 
 * CephFS: The ``client_force_lazyio`` configuration option is now correctly marked
   as not supporting runtime updates. Previously, the configuration schema indicated
