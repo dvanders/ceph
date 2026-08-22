@@ -2,6 +2,7 @@
 Device health monitoring
 """
 
+import calendar
 import errno
 import json
 from mgr_module import MgrModule, CommandResult, MgrModuleRecoverDB, CLIRequiresDB, Option, MgrDBNotReady
@@ -549,7 +550,8 @@ class Module(MgrModule):
         if not t:
             return 0
         else:
-            return int(datetime.strptime(t, TIME_FORMAT).strftime("%s"))
+            # timestamps are written with utcfromtimestamp(), so parse as UTC
+            return calendar.timegm(datetime.strptime(t, TIME_FORMAT).timetuple())
 
     def _get_device_metrics(self, devid: str,
                             sample: Optional[str] = None,
