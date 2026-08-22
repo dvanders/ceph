@@ -149,7 +149,10 @@ Ceph can predict drive life expectancy and device failures by analyzing the
 health metrics that it collects. The prediction modes are as follows:
 
 * *none*: disable device failure prediction.
-* *local*: use a pre-trained prediction model from the ``ceph-mgr`` daemon.
+* *smart*: use the rule-based SMART predictor built into the ``devicehealth``
+  module. See :ref:`devicehealth-smart-prediction` below.
+* *local*: use a pre-trained machine-learning model from the
+  ``diskprediction_local`` module. See :ref:`diskprediction`.
 
 To configure the prediction mode, run a command of the following form:
 
@@ -191,6 +194,128 @@ Life expectancies are expressed as a time interval. This means that the
 uncertainty of the life expectancy can be expressed in the form of a range of
 time, and perhaps a wide range of time. The interval's end can be left
 unspecified.
+
+.. _devicehealth-smart-prediction:
+
+The SMART predictor
+-------------------
+
+The ``smart`` mode applies a small set of rules to the SMART data that
+``devicehealth`` already collects. It needs no additional mgr module or model.
+Each device gets one of four verdicts:
+
++-------------+---------------------------------+-------------------------------+
+| Verdict     | Meaning                         | Life expectancy recorded      |
++=============+=================================+===============================+
+| ``Good``    | No rule matched.                | More than six weeks.          |
++-------------+---------------------------------+-------------------------------+
+| ``Warning`` | A defect counter is growing, or | Two to six weeks. Raises a    |
+|             | a value is near its limit.      | health warning.               |
++-------------+---------------------------------+-------------------------------+
+| ``Bad``     | The device failed a check       | Less than two weeks. Marks    |
+|             | outright.                       | the OSD ``out`` if            |
+|             |                                 | ``self_heal`` is enabled.     |
++-------------+---------------------------------+-------------------------------+
+| ``Unknown`` | No usable SMART data.           | None. Clears any earlier      |
+|             |                                 | value.                        |
++-------------+---------------------------------+-------------------------------+
+
+The verdicts are risk tiers, not countdowns. On the Backblaze Q1 2026
+drive-stats data (351,095 drives and 1,030 failures over 90 days):
+
+* 4.4% of ``Warning`` devices failed within six weeks, compared with 0.05% of
+  unflagged devices.
+* 11% of ``Bad`` devices failed within two weeks, compared with 0.02% of
+  unflagged devices. This is based on a sample of 62 devices.
+
+Read ``Bad`` as "move the data off this device first", not as "this device
+has two weeks left".
+
+Defect counters are judged on growth. The predictor compares the newest sample
+with the oldest one inside ``mgr/devicehealth/prediction_window`` (30 days by
+default). A drive with a stable count of old reallocated sectors stays
+``Good``, and a warning clears once the counter stops growing. As a result:
+
+* Counter rules need at least two samples.
+* Damage older than the window shows no growth. To catch it, any defect
+  counter at or above 256 warns regardless of growth. Healthy drives read zero
+  or single digits and damaged ones read hundreds or more, so the exact value
+  is not critical. This warning does not clear on its own. Once the device's
+  OSDs are ``out`` and drained, it moves to ``DEVICE_HEALTH_REPLACE``.
+
+The window has no effect beyond ``mgr/devicehealth/retention_period``, which
+limits how long samples are kept.
+
+A device is ``Bad`` when:
+
+* it fails its own SMART self-assessment,
+* an attribute's normalized value has reached its vendor threshold, or
+* an NVMe device reports degraded reliability or read-only media, or its
+  available spare has reached its threshold.
+
+A device is ``Warning`` when:
+
+* one of these counters grows: ``Reallocated_Sector_Ct`` (ATA 5),
+  ``Spin_Retry_Count`` (10), ``End-to-End_Error`` (184),
+  ``Reported_Uncorrect`` (187), ``Command_Timeout`` (188, by 2 or more) or
+  ``Offline_Uncorrectable`` (198),
+* ``Current_Pending_Sector`` (197) is nonzero. This is a gauge that falls as
+  sectors are remapped, so its current value is what counts,
+* an attribute has used 90% of its margin to its vendor threshold,
+* a SAS device's grown defect list or uncorrected error counts grow,
+* an NVMe device's media errors grow, it sets any other critical warning bit,
+  its available spare is within 10 points of its threshold, or its percentage
+  used is 90 or more, or
+* the device has used 90% of its rated write endurance.
+
+The vendor-threshold margin is a fraction of the attribute's whole range, not
+a fixed number of points, because some drives ship with a threshold of 90
+against a fresh value of 100.
+
+Attributes whose meaning varies by vendor, such as ``Raw_Read_Error_Rate`` or
+temperature, are ignored, as is power-on time. A rule does not apply to a
+drive that does not report its attribute.
+
+When a drive reports the ACS Device Statistics log, these statistics are used
+in place of the matching attributes:
+
++-------+--------+------------------------------------------+---------------+
+| Page  | Offset | Statistic                                | Replaces      |
++=======+========+==========================================+===============+
+| 3     | 32     | Reallocated Logical Sectors              | ATA 5         |
++-------+--------+------------------------------------------+---------------+
+| 3     | 48     | Mechanical Start Failures                | ATA 10        |
++-------+--------+------------------------------------------+---------------+
+| 3     | 56     | Reallocation Candidate Logical Sectors   | ATA 197       |
++-------+--------+------------------------------------------+---------------+
+| 4     | 8      | Reported Uncorrectable Errors            | ATA 187       |
++-------+--------+------------------------------------------+---------------+
+| 4     | 16     | Resets Between Command Acceptance and    | ATA 188       |
+|       |        | Completion                               |               |
++-------+--------+------------------------------------------+---------------+
+| 7     | 8      | Percentage Used Endurance Indicator      | wear level    |
++-------+--------+------------------------------------------+---------------+
+
+A statistic is used only when the drive marks it valid. The replaced
+attribute's vendor-threshold margin is still checked.
+
+Helium drives are judged only on the helium attribute's margin to its vendor
+threshold: ``Helium_Level`` (ATA 22, WDC and HGST, threshold 25), or
+``Helium_Condition_Lower`` and ``Helium_Condition_Upper`` (ATA 23 and 24,
+Toshiba, threshold 75). Their raw values are levels rather than counts, and
+are ignored.
+
+To see why a device got its verdict, run a command of the following form:
+
+.. prompt:: bash $
+
+   ceph device explain-health <devid>
+
+::
+
+   WDC_WUH721816ALE6L4_XXXXXXXX: Warning
+     - Current_Pending_Sector (ATA 197) is 8, at or above the threshold of 1
+     - Reallocated_Sector_Ct (ATA 5) grew by 4 over the sample window, to 12
 
 Health alerts
 -------------

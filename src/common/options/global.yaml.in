@@ -7013,12 +7013,14 @@ options:
   type: str
   level: basic
   desc: Method used to predict device failures
-  long_desc: Use 'local' for the machine-learning model in the
+  long_desc: Use 'smart' for the rule-based SMART predictor built into the
+    devicehealth mgr module, 'local' for the machine-learning model in the
     diskprediction_local mgr module, or 'none' to disable prediction.
   default: none
   enum_values:
   - none
   - local
+  - smart
   flags:
   - runtime
 - name: gss_ktab_client_file

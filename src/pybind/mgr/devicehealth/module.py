@@ -13,8 +13,11 @@ from datetime import datetime, timedelta, timezone
 from typing import cast, Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING, Union
 
 from .cli import DevicehealthCLICommand
+from . import predictor
+from .predictor import get_ata_wear_level, get_nvme_wear_level
 
 TIME_FORMAT = '%Y%m%d-%H%M%S'
+LIFE_EXPECTANCY_FORMAT = '%Y-%m-%dT%H:%M:%S'
 
 DEVICE_HEALTH = 'DEVICE_HEALTH'
 DEVICE_HEALTH_IN_USE = 'DEVICE_HEALTH_IN_USE'
@@ -27,28 +30,17 @@ HEALTH_MESSAGES = {
     DEVICE_HEALTH_TOOMANY: 'Too many daemons are expected to fail soon',
 }
 
+DAY = 86400
+WEEK = 7 * DAY
 
-def get_ata_wear_level(data: Dict[Any, Any]) -> Optional[float]:
-    """
-    Extract wear level (as float) from smartctl -x --json output for SATA SSD
-    """
-    for page in data.get("ata_device_statistics", {}).get("pages", []):
-        if page is None or page.get("number") != 7:
-            continue
-        for item in page.get("table", []):
-            if item["offset"] == 8:
-                return item["value"] / 100.0
-    return None
-
-
-def get_nvme_wear_level(data: Dict[Any, Any]) -> Optional[float]:
-    """
-    Extract wear level (as float) from smartctl -x --json output for NVME SSD
-    """
-    pct_used = data.get("nvme_smart_health_information_log", {}).get("percentage_used")
-    if pct_used is None:
-        return None
-    return pct_used / 100.0
+# Life expectancy recorded per verdict, as (from, to) seconds from now; a
+# 'to' of None leaves the upper bound open.  Bad falls inside the default
+# mark_out_threshold, Warning inside warn_threshold only.
+LIFE_EXPECTANCY: Dict[str, Tuple[int, Optional[int]]] = {
+    predictor.BAD: (0, 2 * WEEK - DAY),
+    predictor.WARNING: (2 * WEEK, 6 * WEEK),
+    predictor.GOOD: (6 * WEEK + DAY, None),
+}
 
 
 class Module(MgrModule):
@@ -166,6 +158,15 @@ class Module(MgrModule):
             desc='how frequently to wake up and check device health',
             runtime=True,
         ),
+        Option(
+            name='prediction_window',
+            default=(86400 * 30),
+            type='secs',
+            desc='how far back the smart predictor looks for counter growth',
+            long_desc='Defect counters warn when they grow within this '
+                      'window.  Has no effect beyond retention_period.',
+            runtime=True,
+        ),
     ]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -192,6 +193,7 @@ class Module(MgrModule):
             self.mark_out_max_concurrent = 0
             self.mark_out_min_interval = 0.0
             self.sleep_interval = 0.0
+            self.prediction_window = 0.0
 
     def is_valid_daemon_name(self, who: str) -> bool:
         parts = who.split('.', 1)
@@ -279,9 +281,18 @@ class Module(MgrModule):
     @MgrModuleRecoverDB
     def do_predict_life_expectancy(self, devid: str) -> Tuple[int, str, str]:
         '''
-        Predict life expectancy with local predictor
+        Predict life expectancy of a device
         '''
-        return self.predict_lift_expectancy(devid)
+        return self.predict_life_expectancy(devid)
+
+    @CLIRequiresDB
+    @DevicehealthCLICommand.Read('device explain-health')
+    @MgrModuleRecoverDB
+    def do_explain_health(self, devid: str) -> Tuple[int, str, str]:
+        '''
+        Explain why the smart predictor reached its verdict for a device
+        '''
+        return self.explain_health(devid)
 
     def self_test(self) -> None:
         assert self.db_ready()
@@ -302,6 +313,10 @@ class Module(MgrModule):
             assert r == 0
             self.log.debug(f"after: {after}")
             assert before != after
+            # explain_health is read-only
+            (r, verdict, err) = self.explain_health(devid)
+            assert r == 0
+            self.log.debug(f"verdict: {verdict}")
 
     def config_notify(self) -> None:
         for opt in self.MODULE_OPTIONS:
@@ -906,37 +921,148 @@ class Module(MgrModule):
         # generate a dict of the fields we care about.
         return raw
 
-    def predict_lift_expectancy(self, devid: str) -> Tuple[int, str, str]:
-        plugin_name = ''
-        model = self.get_ceph_option('device_failure_prediction_mode')
-        if cast(str, model).lower() == 'local':
-            plugin_name = 'diskprediction_local'
-        else:
-            return -1, '', 'unable to enable any disk prediction model[local]'
+    def prediction_mode(self) -> str:
+        return cast(str, self.get_ceph_option('device_failure_prediction_mode')).lower()
+
+    def _remote_predict(self, method: str, **kwargs: Any) -> Tuple[int, str, str]:
+        plugin_name = 'diskprediction_local'
         try:
-            can_run, _ = self.remote(plugin_name, 'can_run')
-            if can_run:
-                return self.remote(plugin_name, 'predict_life_expectancy', devid=devid)
-            else:
-                return -1, '', f'{plugin_name} is not available'
-        except Exception:
-            return -1, '', 'unable to invoke diskprediction local or remote plugin'
+            can_run, reason = self.remote(plugin_name, 'can_run')
+            if not can_run:
+                return -errno.EAGAIN, '', f'{plugin_name} is not available: {reason}'
+            return cast(Tuple[int, str, str],
+                        self.remote(plugin_name, method, **kwargs))
+        except Exception as e:
+            return -errno.EIO, '', f'unable to invoke {plugin_name}: {e}'
+
+    def _predict_device(self, devid: str) -> predictor.Prediction:
+        """
+        Run the rule-based predictor over the samples in the prediction window.
+        """
+        window = self.prediction_window or (86400 * 30)
+        since = datetime.now(timezone.utc) - timedelta(seconds=window)
+        metrics = self.get_recent_device_metrics(devid, since.strftime(TIME_FORMAT))
+        # TIME_FORMAT keys sort chronologically; the predictor wants newest first
+        samples = [metrics[t] for t in sorted(metrics.keys(), reverse=True)]
+        prediction = predictor.predict(samples)
+        self.log.debug('device %s: %s (%s sample(s)): %s', devid,
+                       prediction.status, len(samples),
+                       '; '.join(prediction.reasons) or 'no findings')
+        return prediction
+
+    def predict_life_expectancy(self, devid: str) -> Tuple[int, str, str]:
+        mode = self.prediction_mode()
+        if mode == 'local':
+            return self._remote_predict('predict_life_expectancy', devid=devid)
+        elif mode != 'smart':
+            return -errno.EINVAL, '', \
+                'device_failure_prediction_mode is not set to local or smart'
+
+        status = self._predict_device(devid).status
+        if status == predictor.GOOD:
+            return 0, '>6w', ''
+        elif status == predictor.WARNING:
+            return 0, '>=2w and <=6w', ''
+        elif status == predictor.BAD:
+            return 0, '<2w', ''
+        else:
+            return 0, 'unknown', ''
+
+    def explain_health(self, devid: str) -> Tuple[int, str, str]:
+        # works in any mode, so the rules can be evaluated before enabling them
+        prediction = self._predict_device(devid)
+        lines = [f'{devid}: {prediction.status}']
+        if prediction.reasons:
+            lines += [f'  - {reason}' for reason in prediction.reasons]
+        else:
+            lines.append('  - no rule matched')
+        if self.prediction_mode() != 'smart':
+            lines.append('(device_failure_prediction_mode is not "smart", so '
+                         'this verdict is not being acted on)')
+        return 0, '\n'.join(lines), ''
+
+    def _reset_device_life_expectancy(self, devid: str) -> int:
+        result = CommandResult('')
+        self.send_command(result, 'mon', '', json.dumps({
+            'prefix': 'device rm-life-expectancy',
+            'devid': devid,
+        }), '')
+        r, _, outs = result.wait()
+        if r != 0:
+            self.log.error('failed to reset %s life expectancy: %s', devid, outs)
+        return r
+
+    def _set_device_life_expectancy(self, devid: str, from_date: str,
+                                    to_date: Optional[str] = None) -> int:
+        cmd: Dict[str, Any] = {
+            'prefix': 'device set-life-expectancy',
+            'devid': devid,
+            'from': from_date,
+        }
+        if to_date is not None:
+            cmd['to'] = to_date
+        result = CommandResult('')
+        self.send_command(result, 'mon', '', json.dumps(cmd), '')
+        r, _, outs = result.wait()
+        if r != 0:
+            self.log.error('failed to set %s life expectancy: %s', devid, outs)
+        return r
+
+    @staticmethod
+    def _is_still_good(dev: Dict[str, Any]) -> bool:
+        """
+        Whether the device already has an unexpired Good record (open upper
+        bound, lower bound in the future).  Skipping the rewrite saves a mon
+        config-key write per healthy device per pass.
+        """
+        # the mgr dumps an unset bound as '0.000000'
+        if dev.get('life_expectancy_max') not in (None, '', '0.000000'):
+            return False
+        recorded = dev.get('life_expectancy_min')
+        if not recorded:
+            return False
+        try:
+            expires = datetime.strptime(recorded, '%Y-%m-%dT%H:%M:%S.%f%z')
+        except ValueError:
+            return False
+        return expires > datetime.now(timezone.utc)
+
+    def _apply_prediction(self, dev: Dict[str, Any], status: str) -> None:
+        """Translate a verdict into a life expectancy on the device."""
+        devid = dev['devid']
+        if status not in LIFE_EXPECTANCY:
+            # Unknown: retract any earlier expectancy
+            if dev.get('life_expectancy_min') or dev.get('life_expectancy_max'):
+                self._reset_device_life_expectancy(devid)
+            return
+        if status == predictor.GOOD and self._is_still_good(dev):
+            return
+        # utime_t::parse() reads these as UTC; keep the time of day
+        now = datetime.now(timezone.utc)
+        low, high = LIFE_EXPECTANCY[status]
+        from_date = (now + timedelta(seconds=low)).strftime(LIFE_EXPECTANCY_FORMAT)
+        to_date = None
+        if high is not None:
+            to_date = (now + timedelta(seconds=high)).strftime(LIFE_EXPECTANCY_FORMAT)
+        if self._set_device_life_expectancy(devid, from_date, to_date) == 0:
+            self.log.info('set %s life expectancy from %s to %s (%s)',
+                          devid, from_date, to_date or 'unset', status)
 
     def predict_all_devices(self) -> Tuple[int, str, str]:
-        plugin_name = ''
-        model = self.get_ceph_option('device_failure_prediction_mode')
-        if cast(str, model).lower() == 'local':
-            plugin_name = 'diskprediction_local'
-        else:
-            return -1, '', 'unable to enable any disk prediction model[local]'
-        try:
-            can_run, _ = self.remote(plugin_name, 'can_run')
-            if can_run:
-                return self.remote(plugin_name, 'predict_all_devices')
-            else:
-                return -1, '', f'{plugin_name} is not available'
-        except Exception:
-            return -1, '', 'unable to invoke diskprediction local or remote plugin'
+        mode = self.prediction_mode()
+        if mode == 'local':
+            return self._remote_predict('predict_all_devices')
+        elif mode != 'smart':
+            self.log.debug('device failure prediction is disabled')
+            return 0, '', ''
+
+        self.log.debug('predict_all_devices')
+        for dev in self.get('devices').get('devices', []):
+            devid = dev.get('devid')
+            if not devid or not dev.get('daemons'):
+                continue
+            self._apply_prediction(dev, self._predict_device(devid).status)
+        return 0, '', ''
 
     def get_recent_device_metrics(self, devid: str, min_sample: str) -> Dict[str, Dict[str, Any]]:
         try:

@@ -10,6 +10,9 @@ failure predictions and returns them back to Ceph. It requires no external
 server for data analysis and the outputting of results. Its internal
 predictor's accuracy is around 70%.
 
+.. note:: This module needs ``scipy`` and ``numpy``. For prediction without
+   them, with verdicts you can inspect, see :ref:`devicehealth-smart-prediction`.
+
 Enabling
 ========
 
