@@ -85,16 +85,17 @@ KernelDevice::KernelDevice(CephContext* cct, aio_callback_t cb, void *cbpriv, ai
   fd_directs.resize(WRITE_LIFE_MAX, -1);
   fd_buffereds.resize(WRITE_LIFE_MAX, -1);
 
-  bool use_ioring = cct->_conf.get_val<bool>("bdev_ioring");
+  bool want_ioring = cct->_conf.get_val<bool>("bdev_ioring");
   unsigned int iodepth = cct->_conf->bdev_aio_max_queue_depth;
 
-  if (use_ioring && ioring_queue_t::supported()) {
+  if (want_ioring && ioring_queue_t::supported()) {
     bool use_ioring_hipri = cct->_conf.get_val<bool>("bdev_ioring_hipri");
     bool use_ioring_sqthread_poll = cct->_conf.get_val<bool>("bdev_ioring_sqthread_poll");
     io_queue = std::make_unique<ioring_queue_t>(iodepth, use_ioring_hipri, use_ioring_sqthread_poll);
+    use_ioring = true;
   } else {
     static bool once;
-    if (use_ioring && !once) {
+    if (want_ioring && !once) {
       derr << "WARNING: io_uring API is not supported! Fallback to libaio!"
            << dendl;
       once = true;
@@ -1493,17 +1494,27 @@ int KernelDevice::aio_read(
   uint64_t off,
   uint64_t len,
   bufferlist *pbl,
-  IOContext *ioc)
+  IOContext *ioc,
+  bool buffered)
 {
   dout(5) << __func__ << " 0x" << std::hex << off << "~" << len << std::dec
+	  << " " << buffermode(buffered)
 	  << dendl;
 
   int r = 0;
 #ifdef HAVE_LIBAIO
-  if (aio && dio) {
+  // A buffered read has to go to the fd that was not opened O_DIRECT, so that
+  // the kernel page cache can serve it. libaio degrades to a blocking submit
+  // on such a descriptor, which would stall the submitting thread for the
+  // whole batch, so only take the async path when io_uring - which does
+  // support buffered I/O asynchronously - is in use. Otherwise fall back to a
+  // synchronous read, which costs us the parallelism across the extents of a
+  // single read but never blocks anyone else's submission.
+  if (aio && dio && (!buffered || use_ioring)) {
     ceph_assert(is_valid_io(off, len));
     _aio_log_start(ioc, off, len);
-    ioc->pending_aios.push_back(aio_t(ioc, fd_directs[WRITE_LIFE_NOT_SET]));
+    ioc->pending_aios.push_back(
+      aio_t(ioc, choose_fd(buffered, WRITE_LIFE_NOT_SET)));
     ++ioc->num_pending;
     aio_t& aio = ioc->pending_aios.back();
     aio.bl.push_back(
@@ -1517,7 +1528,7 @@ int KernelDevice::aio_read(
   } else
 #endif
   {
-    r = read(off, len, pbl, ioc, false);
+    r = read(off, len, pbl, ioc, buffered);
   }
 
   return r;
