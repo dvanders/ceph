@@ -6,7 +6,6 @@ import calendar
 import errno
 import json
 from mgr_module import MgrModule, CommandResult, MgrModuleRecoverDB, CLIRequiresDB, Option, MgrDBNotReady
-import operator
 import rados
 import re
 from threading import Event
@@ -142,6 +141,25 @@ class Module(MgrModule):
             runtime=True,
         ),
         Option(
+            name='mark_out_max_concurrent',
+            default=1,
+            type='int',
+            min=0,
+            desc='how many devices self-heal may have draining at once',
+            long_desc='OSDs sharing a device count as one.  Set to 0 to keep '
+                      'the health checks but never mark an OSD out.',
+            runtime=True,
+        ),
+        Option(
+            name='mark_out_min_interval',
+            default=3600,
+            type='secs',
+            desc='minimum time between self-heal mark out actions',
+            long_desc='Needed because an OSD with no data drains '
+                      'instantly, which the concurrency limit cannot slow.',
+            runtime=True,
+        ),
+        Option(
             name='sleep_interval',
             default=600,
             type='secs',
@@ -171,6 +189,8 @@ class Module(MgrModule):
             self.mark_out_threshold = 0.0
             self.warn_threshold = 0.0
             self.self_heal = True
+            self.mark_out_max_concurrent = 0
+            self.mark_out_min_interval = 0.0
             self.sleep_interval = 0.0
 
     def is_valid_daemon_name(self, who: str) -> bool:
@@ -622,6 +642,8 @@ class Module(MgrModule):
         devs = self.get("devices")
         osds_in = {}
         osds_out = {}
+        # devid -> (life expectancy, host, the OSDs on it that are still in)
+        devices_in: Dict[str, Tuple[datetime, Optional[str], List[str]]] = {}
         now = datetime.now(timezone.utc)  # e.g. '2021-09-22 13:18:45.021712+00:00'
         osdmap = self.get("osd_map")
         assert osdmap is not None
@@ -654,6 +676,15 @@ class Module(MgrModule):
                             osds_in[_id] = life_expectancy_max
                         else:
                             osds_out[_id] = 1
+                    # OSDs sharing a device are marked out together
+                    still_in = [x for x in osd_ids
+                                if self.is_osd_in(osdmap, x)]
+                    if still_in:
+                        devices_in[dev['devid']] = (
+                            life_expectancy_max,
+                            dev['location'][0]['host'] if dev['location']
+                            else None,
+                            still_in)
 
             if life_expectancy_max - now <= warn_threshold_td:
                 # device can appear in more than one location in case
@@ -682,18 +713,19 @@ class Module(MgrModule):
                     'osd.%s is marked out '
                     'but still has %s PG(s)' %
                     (_id, num_pgs))
-        if osds_in:
+        if devices_in:
             self.log.debug('osds_in %s' % osds_in)
             # calculate target in ratio
             num_osds = len(osdmap['osds'])
             num_in = len([x for x in osdmap['osds'] if x['in']])
             num_bad = len(osds_in)
             # sort with next-to-fail first
-            bad_osds = sorted(osds_in.items(), key=operator.itemgetter(1))
+            bad_devices = sorted(devices_in.items(),
+                                 key=lambda kv: kv[1][0])
             did = 0
-            to_mark_out = []
-            for osd_id, when in bad_osds:
-                ratio = float(num_in - did - 1) / float(num_osds)
+            eligible: List[Tuple[str, Optional[str], List[str]]] = []
+            for devid, (when, host, group) in bad_devices:
+                ratio = float(num_in - did - len(group)) / float(num_osds)
                 if ratio < min_in_ratio:
                     final_ratio = float(num_in - num_bad) / float(num_osds)
                     checks[DEVICE_HEALTH_TOOMANY] = {
@@ -704,11 +736,16 @@ class Module(MgrModule):
                                 num_bad - did, final_ratio, min_in_ratio)
                         ]
                     }
-                    break
-                to_mark_out.append(osd_id)
-                did += 1
-            if to_mark_out:
-                self.mark_out_etc(to_mark_out)
+                    # skip it; smaller devices behind it may still fit
+                    continue
+                eligible.append((devid, host, group))
+                did += len(group)
+            if eligible:
+                history = self._mark_out_history(osdmap)
+                to_mark_out = self._limit_mark_out(eligible, history, now)
+                if to_mark_out:
+                    self.mark_out_etc(to_mark_out)
+                    self._record_mark_out(eligible, to_mark_out, history, now)
         for warning, ls in health_warnings.items():
             n = len(ls)
             if n:
@@ -720,6 +757,96 @@ class Module(MgrModule):
                 }
         self.set_health_checks(checks)
         return 0, "", ""
+
+    def _mark_out_history(self,
+                          osdmap: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        """OSDs that self-heal has marked out and that are still out.
+
+        Kept in the module store so a mgr failover does not reset the limits.
+        """
+        raw = self.get_store('mark_out_history')
+        try:
+            history = json.loads(raw) if raw else {}
+        except ValueError:
+            self.log.warning('ignoring unparseable mark_out_history')
+            return {}
+        known = {str(osd['osd']): osd for osd in osdmap['osds']}
+        return {osd_id: rec for osd_id, rec in history.items()
+                if osd_id in known and not known[osd_id]['in']}
+
+    def _record_mark_out(self,
+                         eligible: List[Tuple[str, Optional[str], List[str]]],
+                         marked_out: List[str],
+                         history: Dict[str, Dict[str, Any]],
+                         now: datetime) -> None:
+        marked = set(marked_out)
+        for devid, host, group in eligible:
+            for osd_id in group:
+                if osd_id in marked:
+                    history[osd_id] = {'at': now.timestamp(),
+                                       'host': host,
+                                       'devid': devid}
+        self.set_store('mark_out_history', json.dumps(history))
+
+    def _limit_mark_out(self,
+                        eligible: List[Tuple[str, Optional[str], List[str]]],
+                        history: Dict[str, Dict[str, Any]],
+                        now: datetime) -> List[str]:
+        """Return the OSDs self-heal may mark out now, within the rate limits.
+
+        ``eligible`` is (devid, host, osds), sorted next-to-fail first.
+        """
+        max_concurrent = int(self.mark_out_max_concurrent)
+        if max_concurrent <= 0:
+            self.log.warning('self_heal would evacuate %d device(s) but '
+                             'mark_out_max_concurrent is 0: %s',
+                             len(eligible), [d for d, _, _ in eligible])
+            return []
+
+        interval = float(self.mark_out_min_interval)
+        if interval and history:
+            waited = now.timestamp() - max(rec.get('at', 0.0)
+                                           for rec in history.values())
+            if waited < interval:
+                self.log.info('deferring evacuation of %d device(s): last '
+                              'mark out was %ds ago, mark_out_min_interval '
+                              'is %ds', len(eligible), int(waited),
+                              int(interval))
+                return []
+
+        # an unknown PG count (-1) counts as still draining
+        draining: Dict[str, Optional[str]] = {}
+        for osd_id, rec in history.items():
+            if self.get_osd_num_pgs(osd_id) != 0:
+                draining[rec.get('devid') or osd_id] = rec.get('host')
+        slots = max_concurrent - len(draining)
+        if slots <= 0:
+            self.log.info('deferring evacuation of %d device(s): %d already '
+                          'draining, mark_out_max_concurrent is %d',
+                          len(eligible), len(draining), max_concurrent)
+            return []
+
+        # one device per host at a time, to spread backfill load and protect
+        # CRUSH rules with an OSD failure domain
+        busy = set(draining.values())
+        busy.discard(None)
+        allowed: List[str] = []
+        taken = 0
+        for devid, host, group in eligible:
+            if taken >= slots:
+                break
+            if host is not None and host in busy:
+                continue
+            allowed.extend(group)
+            busy.add(host)
+            taken += 1
+
+        deferred = len(eligible) - taken
+        if deferred:
+            self.log.info('evacuating %d device(s) (%d OSDs), deferring %d '
+                          'device(s) to a later pass',
+                          taken, len(allowed), deferred)
+        return allowed
 
     def _awaiting_replacement(self,
                               osdmap: Dict[str, Any],

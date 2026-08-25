@@ -40,6 +40,17 @@
   under a new ``DEVICE_HEALTH_REPLACE`` health check instead of
   ``DEVICE_HEALTH``, so it does not hide devices that still hold data.
 
+* MGR: ``devicehealth`` self-heal is now rate limited. Previously only
+  ``mon_osd_min_in_ratio`` limited it, which allowed a large fraction of a
+  cluster to be marked ``out`` in one pass.
+  ``mgr/devicehealth/mark_out_max_concurrent`` (default 1) limits how many
+  devices drain at once, and ``mgr/devicehealth/mark_out_min_interval``
+  (default one hour) limits how often a device is marked ``out``. Self-heal no
+  longer drains two devices on the same host at once. OSDs that share a
+  device, such as several OSDs with ``block.db`` on one NVMe, are marked
+  ``out`` together and count as one device. To approach the old behaviour,
+  raise ``mark_out_max_concurrent`` and set ``mark_out_min_interval`` to 0.
+
 * MGR: The ``cloud`` value of ``device_failure_prediction_mode`` has been
   removed; the ``diskprediction_cloud`` module it selected no longer exists.
   Clusters with it set should switch to ``local`` or ``none``.

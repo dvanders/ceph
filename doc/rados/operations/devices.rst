@@ -219,9 +219,9 @@ migrates data away from devices that are expected to fail soon. If this option
 is enabled, the module marks such devices ``out`` so that automatic migration
 will occur.
 
-.. note:: The ``mon_osd_min_up_ratio`` configuration option can help prevent
+.. note:: The ``mon_osd_min_in_ratio`` configuration option can help prevent
    this process from cascading to total failure. If the "self heal" module
-   marks ``out`` so many OSDs that the ratio value of ``mon_osd_min_up_ratio``
+   marks ``out`` so many OSDs that the ratio value of ``mon_osd_min_in_ratio``
    is exceeded, then the cluster raises the ``DEVICE_HEALTH_TOOMANY`` health
    check. For instructions on what to do in this situation, see
    :ref:`DEVICE_HEALTH_TOOMANY<rados_health_checks_device_health_toomany>`.
@@ -229,3 +229,32 @@ will occur.
 The ``mgr/devicehealth/mark_out_threshold`` configuration option specifies the
 time interval for automatic migration. If a device is expected to fail within
 the specified time interval, it will be automatically marked ``out``.
+
+Rate limiting
+~~~~~~~~~~~~~
+
+``mon_osd_min_in_ratio`` is a floor, not a rate limit: on its own it allows a
+large part of a cluster to be marked ``out`` in one pass. Because predictions
+and scrapes can be wrong, self-heal is also rate limited:
+
+``mgr/devicehealth/mark_out_max_concurrent`` (default 1)
+   How many devices self-heal may have draining at once. Another device is not
+   marked ``out`` until these have drained. ``0`` keeps the health checks but
+   never marks anything ``out``.
+``mgr/devicehealth/mark_out_min_interval`` (default one hour)
+   The minimum time between mark outs. This matters because an OSD with no
+   data drains immediately.
+
+The limits count devices, not OSDs. OSDs that share a device, for example
+several OSDs with ``block.db`` on one NVMe drive, are marked ``out`` together
+and count as one device.
+
+Self-heal does not drain two devices on the same host at once. This spreads
+the backfill load, and protects CRUSH rules whose failure domain is the OSD.
+
+A device with more OSDs than ``mon_osd_min_in_ratio`` allows is not evacuated
+and raises ``DEVICE_HEALTH_TOOMANY``. Self-heal moves on to the next device.
+
+An OSD stops counting against the limits once it has drained, is marked back
+``in``, or is removed. The accounting is kept in the module's store, so it
+survives a mgr restart or failover.
