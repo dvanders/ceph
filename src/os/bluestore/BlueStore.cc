@@ -13056,8 +13056,15 @@ void BlueStore::_read_cache(
 int BlueStore::_prepare_read_ioc(
   blobs2read_t& blobs2read,
   vector<bufferlist>* compressed_blob_bls,
-  IOContext* ioc)
+  IOContext* ioc,
+  bool buffered)
 {
+  // Reading through the buffered file descriptor lets the Linux page cache
+  // serve repeated reads of the same extent, at the cost of a second copy of
+  // the data in the kernel. Only worth doing for data we would keep in our own
+  // cache anyway, so honour the same flag the client's fadvise hints produce.
+  const bool page_cache = buffered && cct->_conf->bluestore_page_cache_read;
+
   for (auto& p : blobs2read) {
     const BlobRef& bptr = p.first;
     regions2read_t& r2r = p.second;
@@ -13074,7 +13081,7 @@ int BlueStore::_prepare_read_ioc(
       auto r = bptr->get_blob().map(
         0, bptr->get_blob().get_ondisk_size(),
         [&](uint64_t offset, uint64_t length) {
-          int r = bdev->aio_read(offset, length, &bl, ioc);
+          int r = bdev->aio_read(offset, length, &bl, ioc, page_cache);
           if (r < 0)
             return r;
           return 0;
@@ -13101,7 +13108,7 @@ int BlueStore::_prepare_read_ioc(
         auto r = bptr->get_blob().map(
           req.r_off, req.r_len,
           [&](uint64_t offset, uint64_t length) {
-            int r = bdev->aio_read(offset, length, &req.bl, ioc);
+            int r = bdev->aio_read(offset, length, &req.bl, ioc, page_cache);
             if (r < 0)
               return r;
             return 0;
@@ -13331,7 +13338,7 @@ int BlueStore::_do_read(
                              // The error isn't that much...
   vector<bufferlist> compressed_blob_bls;
   IOContext ioc(cct, NULL, !cct->_conf->bluestore_fail_eio);
-  r = _prepare_read_ioc(blobs2read, &compressed_blob_bls, &ioc);
+  r = _prepare_read_ioc(blobs2read, &compressed_blob_bls, &ioc, buffered);
   // we always issue aio for reading, so errors other than EIO are not allowed
   if (r < 0)
     return r;
@@ -13740,7 +13747,8 @@ int BlueStore::_do_readv(
     raw_results.push_back({});
     _read_cache(o, p.get_start(), p.get_len(), read_cache_policy,
                 std::get<0>(raw_results[i]), std::get<2>(raw_results[i]));
-    r = _prepare_read_ioc(std::get<2>(raw_results[i]), &std::get<1>(raw_results[i]), &ioc);
+    r = _prepare_read_ioc(std::get<2>(raw_results[i]), &std::get<1>(raw_results[i]),
+                          &ioc, buffered);
     // we always issue aio for reading, so errors other than EIO are not allowed
     if (r < 0)
       return r;

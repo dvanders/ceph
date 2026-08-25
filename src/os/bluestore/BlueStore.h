@@ -3373,7 +3373,8 @@ private:
   int _prepare_read_ioc(
     blobs2read_t& blobs2read,
     std::vector<ceph::buffer::list>* compressed_blob_bls,
-    IOContext* ioc);
+    IOContext* ioc,
+    bool buffered);
 
   int _generate_read_result_bl(
     OnodeRef& o,
