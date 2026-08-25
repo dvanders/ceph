@@ -153,6 +153,28 @@ removed from the damage table.
 
 .. note:: A scrub invoked with the ``repair`` option can identify a damaged hard link but not repair it.
 
+Repairing a recursive ctime in the future
+=========================================
+
+``rstat.rctime`` is a recursive maximum propagated to every ancestor, and
+ordinary operation never lowers it. An inode whose timestamp was once set far
+into the future therefore pins the ``rctime`` of the whole tree above it
+permanently, and that ``rctime`` can no longer be advanced by real changes,
+hiding them from anything using ``rctime`` to detect what changed.
+
+A ``repair`` scrub only lowers ``rctime`` when
+``mds_scrub_repair_future_rctime`` is set, since it depends on correct MDS clocks
+and consumers tracking ``rctime`` will see it move backwards once::
+
+    ceph config set mds mds_scrub_repair_future_rctime true
+    ceph tell mds.<fsname>:0 scrub start / recursive,repair
+    ceph config set mds mds_scrub_repair_future_rctime false
+
+Scrub recomputes a directory's ``rstat`` from its children, so correct any files
+first -- touching a file corrects its own ``rctime`` -- and then scrub to bring
+the directories down. Incoming client timestamps are clamped so that new
+occurrences are bounded; see ``mds_client_timestamp_future_slack``.
+
 
 Evaluate Strays Using Recursive Scrub
 =====================================

@@ -2820,8 +2820,21 @@ void CInode::finish_scatter_gather_update(int type, MutationRef& mut)
 	  }
 	  // trust the dirfrag for now
 	  version_t v = pi->rstat.version;
-	  if (pi->rstat.rctime > rstat.rctime)
-	    rstat.rctime = pi->rstat.rctime;
+	  /* The dirfrags do not carry this directory's own ctime, which is why
+	   * same_sums() accepts a higher stored rctime; fold it in so the
+	   * recomputed value is the real expected maximum. */
+	  if (rstat.rctime < pi->ctime)
+	    rstat.rctime = pi->ctime;
+	  bool repair_rctime = state_test(CInode::STATE_REPAIRSTATS) &&
+	    g_conf().get_val<bool>("mds_scrub_repair_future_rctime");
+	  if (pi->rstat.rctime > rstat.rctime) {
+	    if (repair_rctime) {
+	      dout(10) << " lowering rctime " << pi->rstat.rctime << " -> "
+		       << rstat.rctime << " on " << *this << dendl;
+	    } else {
+	      rstat.rctime = pi->rstat.rctime;
+	    }
+	  }
 	  pi->rstat = rstat;
 	  pi->rstat.version = v;
 	}
@@ -5166,18 +5179,26 @@ next:
       nest_info.rsubdirs++; // it gets one to account for self
       if (const sr_t *srnode = in->get_projected_srnode(); srnode)
 	nest_info.rsnaps += srnode->snaps.size();
+      /* the dirfrags do not carry this directory's own ctime */
+      if (nest_info.rctime < in->get_inode()->ctime)
+	nest_info.rctime = in->get_inode()->ctime;
 
       // ...and that their sum matches our inode settings
+      bool future_rctime =
+	g_conf().get_val<bool>("mds_scrub_repair_future_rctime") &&
+	in->get_inode()->rstat.rctime_ahead_of(nest_info);
       if (!dir_info.same_sums(in->get_inode()->dirstat) ||
-	  !nest_info.same_sums(in->get_inode()->rstat)) {
+	  !nest_info.same_sums(in->get_inode()->rstat) ||
+	  future_rctime) {
+	std::string_view what = future_rctime ?
+	  "existing rctime is ahead of the freshly-calculated one" :
+	  "freshly-calculated rstats don't match existing ones";
 	if (in->scrub_infop->header->get_repair()) {
-	  results->raw_stats.error_str
-	    << "freshly-calculated rstats don't match existing ones (will be fixed)";
+	  results->raw_stats.error_str << what << " (will be fixed)";
 	  in->mdcache->repair_inode_stats(in);
           results->raw_stats.repaired = true;
 	} else {
-	  results->raw_stats.error_str
-	    << "freshly-calculated rstats don't match existing ones";
+	  results->raw_stats.error_str << what;
 	}
         if (in->is_dirty()) {
           MDCache *mdcache = in->mdcache; // for dout()

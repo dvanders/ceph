@@ -168,12 +168,20 @@ struct nest_info_t : public scatter_info_t {
     rsnaps += cur.rsnaps - acc.rsnaps;
   }
 
+  /* Note the rctime comparison: a stored rctime *ahead* of a recomputed one
+   * counts as matching, since rctime is a maximum that recomputation
+   * legitimately trails. See rctime_ahead_of(). */
   bool same_sums(const nest_info_t &o) const {
     return rctime <= o.rctime &&
         rbytes == o.rbytes &&
         rfiles == o.rfiles &&
         rsubdirs == o.rsubdirs &&
         rsnaps == o.rsnaps;
+  }
+
+  /* The divergence same_sums() tolerates. Only a scrub repair acts on it. */
+  bool rctime_ahead_of(const nest_info_t &o) const {
+    return rctime > o.rctime;
   }
 
   void encode(ceph::buffer::list &bl) const;

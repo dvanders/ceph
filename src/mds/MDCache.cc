@@ -13585,8 +13585,13 @@ void MDCache::repair_dirfrag_stats_work(const MDRequestRef& mdr)
   }
 
   auto pf = dir->get_projected_fnode();
+  /* the child inodes do not carry this dirfrag's own mtime */
+  if (nest_info.rctime < pf->fragstat.mtime)
+    nest_info.rctime = pf->fragstat.mtime;
+  bool repair_rctime = g_conf().get_val<bool>("mds_scrub_repair_future_rctime");
   bool good_fragstat = frag_info.same_sums(pf->fragstat);
-  bool good_rstat = nest_info.same_sums(pf->rstat);
+  bool good_rstat = nest_info.same_sums(pf->rstat) &&
+    !(repair_rctime && pf->rstat.rctime_ahead_of(nest_info));
   if (good_fragstat && good_rstat) {
     dout(10) << __func__ << " no corruption found" << dendl;
     mds->server->respond_to_request(mdr, 0);
@@ -13612,8 +13617,16 @@ void MDCache::repair_dirfrag_stats_work(const MDRequestRef& mdr)
   }
 
   if (!good_rstat) {
-    if (pf->rstat.rctime > nest_info.rctime)
-      nest_info.rctime = pf->rstat.rctime;
+    /* As in CInode::finish_scatter_gather_update(): only an explicit repair
+     * may lower rctime. */
+    if (pf->rstat.rctime > nest_info.rctime) {
+      if (repair_rctime) {
+	dout(10) << __func__ << " lowering rctime " << pf->rstat.rctime
+		 << " -> " << nest_info.rctime << " on " << *dir << dendl;
+      } else {
+	nest_info.rctime = pf->rstat.rctime;
+      }
+    }
     _pf->rstat = nest_info;
     mds->locker->mark_updated_scatterlock(&diri->nestlock);
     mdr->ls->dirty_dirfrag_nest.push_back(&diri->item_dirty_dirfrag_nest);

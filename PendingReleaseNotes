@@ -1176,3 +1176,17 @@ Relevant tracker: https://tracker.ceph.com/issues/71677
   rather than only raised. Ancestor directories still hold a maximum over their
   subtree and cannot be lowered this way -- correcting those needs a repair
   scrub with ``mds_scrub_repair_future_rctime``.
+* CephFS: ``scrub start <path> recursive,repair`` can now lower an
+  ``rstat.rctime`` sitting ahead of its recomputed value, when the new
+  ``mds_scrub_repair_future_rctime`` is enabled (default off). Three places
+  previously stopped ``rctime`` ever decreasing: ``nest_info_t::same_sums()``
+  reports a stored ``rctime`` above the recomputed one as matching, so scrub
+  never flagged it; ``CInode::finish_scatter_gather_update()`` and
+  ``MDCache::repair_dirfrag_stats_work()`` both restored the stored value, the
+  latter even while repairing. A future ``rctime`` was therefore permanent, with
+  no tool able to correct it. Off by default: it relies on correct MDS clocks and
+  consumers tracking ``rctime`` will see it move backwards once.
+
+  Scrub recomputes a directory's ``rstat`` from its children's
+  ``accounted_rstat``, so correct the files first -- touching one now corrects
+  its own ``rctime`` -- then run the scrub to bring the directories down.

@@ -507,6 +507,24 @@ options:
   - mds
   flags:
   - runtime
+- name: mds_scrub_repair_future_rctime
+  type: bool
+  level: advanced
+  desc: allow scrub repair to lower an rctime that is ahead of its recomputed value
+  long_desc: rctime is a recursive maximum which ordinary operation never lowers,
+    so an rctime once pushed into the future is permanent and can no longer be
+    advanced by real changes, hiding them from rctime-based change detection.
+    This makes scrub treat a stored rctime ahead of its recomputed value as an
+    inconsistency, so a repair scrub lowers it. Off by default, as it depends on
+    the MDS clocks being correct and consumers tracking rctime will see it move
+    backwards once. Enable it, run a recursive repair scrub, disable it again.
+  default: false
+  services:
+  - mds
+  flags:
+  - runtime
+  see_also:
+  - mds_client_timestamp_future_slack
 - name: mds_client_timestamp_future_slack
   type: secs
   level: advanced
