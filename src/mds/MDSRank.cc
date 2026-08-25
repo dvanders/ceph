@@ -531,6 +531,8 @@ MDSRank::MDSRank(
 
   _heartbeat_reset_grace = g_conf().get_val<uint64_t>("mds_heartbeat_reset_grace");
   heartbeat_grace = g_conf().get_val<double>("mds_heartbeat_grace");
+  client_timestamp_future_slack =
+    g_conf().get_val<std::chrono::seconds>("mds_client_timestamp_future_slack").count();
   mds_dmclock_scheduler = new MDSDmclockScheduler(this);
 
   op_tracker.set_complaint_and_threshold(cct->_conf->mds_op_complaint_time,
@@ -1567,6 +1569,19 @@ void MDSRank::send_message_client(const ref_t<Message>& m, Session* session)
   } else {
     session->preopen_out_queue.push_back(m);
   }
+}
+
+utime_t MDSRank::clamp_untrusted_timestamp(utime_t stamp) const
+{
+  utime_t limit = ceph_clock_now();
+  limit += client_timestamp_future_slack;
+  if (stamp > limit) {
+    dout(10) << __func__ << " clamping " << stamp << " to " << limit
+             << " (mds_client_timestamp_future_slack "
+             << client_timestamp_future_slack << "s)" << dendl;
+    return limit;
+  }
+  return stamp;
 }
 
 /**
@@ -4150,6 +4165,7 @@ std::vector<std::string> MDSRankDispatcher::get_tracked_keys()
     "mds_cache_trim_decay_rate",
     "mds_cap_acquisition_throttle_retry_request_time",
     "mds_cap_revoke_eviction_timeout",
+    "mds_client_timestamp_future_slack",
     "mds_debug_subtrees",
     "mds_dir_max_entries",
     "mds_dmclock_enable",
@@ -4220,6 +4236,10 @@ void MDSRankDispatcher::handle_conf_change(const ConfigProxy& conf, const std::s
   }
   if (changed.count("mds_heartbeat_grace")) {
     heartbeat_grace = conf.get_val<double>("mds_heartbeat_grace");
+  }
+  if (changed.count("mds_client_timestamp_future_slack")) {
+    client_timestamp_future_slack =
+      conf.get_val<std::chrono::seconds>("mds_client_timestamp_future_slack").count();
   }
   if (changed.count("mds_op_complaint_time") || changed.count("mds_op_log_threshold")) {
     op_tracker.set_complaint_and_threshold(conf->mds_op_complaint_time, conf->mds_op_log_threshold);

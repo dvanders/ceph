@@ -9782,7 +9782,9 @@ MDRequestRef MDCache::request_start(const cref_t<MClientRequest>& req)
   MDRequestRef mdr =
       mds->op_tracker.create_request<MDRequestImpl,MDRequestImpl::Params*>(&params);
   active_requests[params.reqid] = mdr;
-  mdr->set_op_stamp(req->get_stamp());
+  /* Client supplied and never legitimately ahead of now; it becomes the inode
+   * ctime/mtime and, via predirty_journal_parents(), rctime on every ancestor. */
+  mdr->set_op_stamp(mds->clamp_untrusted_timestamp(req->get_stamp()));
   dout(7) << "request_start " << *mdr << dendl;
   return mdr;
 }

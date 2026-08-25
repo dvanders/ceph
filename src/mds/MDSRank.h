@@ -365,6 +365,14 @@ class MDSRank {
     bool queue_one_replay();
     void maybe_clientreplay_done();
 
+    /* Bound an untrusted timestamp -- a client request stamp, a ctime/mtime
+     * reported in a cap flush, or an mtime recovered from the object store --
+     * to mds_client_timestamp_future_slack past the MDS clock. rctime is a
+     * recursive maximum that is never lowered, so an unbounded future value
+     * pins the rctime of every ancestor and masks later changes.
+     */
+    utime_t clamp_untrusted_timestamp(utime_t stamp) const;
+
     void set_osd_epoch_barrier(epoch_t e);
     epoch_t get_osd_epoch_barrier() const {return osd_epoch_barrier;}
     epoch_t get_osd_epoch() const;
@@ -636,6 +644,9 @@ class MDSRank {
     std::map<epoch_t, std::vector<MDSContext*>> waiting_for_mdsmap;
 
     epoch_t osd_epoch_barrier = 0;
+
+    // mds_client_timestamp_future_slack, in seconds
+    double client_timestamp_future_slack = 0;
 
     // Const reference to the beacon so that we can behave differently
     // when it's laggy.

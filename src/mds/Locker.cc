@@ -3130,11 +3130,14 @@ bool Locker::check_inode_max_size(CInode *in, bool force_wrlock,
     pi.inode->rstat.rbytes = new_size;
     dout(10) << "check_inode_max_size mtime " << pi.inode->mtime << " -> " << new_mtime << dendl;
     pi.inode->mtime = new_mtime;
-    if (new_mtime > pi.inode->ctime) {
-      pi.inode->ctime = new_mtime;
-      if (new_mtime > pi.inode->rstat.rctime)
-	pi.inode->rstat.rctime = new_mtime;
-    }
+    /* The status change is happening now, so ctime comes from the MDS clock.
+     * Deriving it from mtime let a future mtime drag ctime and rctime along,
+     * and a past mtime suppress both. */
+    utime_t now = ceph_clock_now();
+    if (now > pi.inode->ctime)
+      pi.inode->ctime = now;
+    if (now > pi.inode->rstat.rctime)
+      pi.inode->rstat.rctime = now;
   }
 
   // use EOpen if the file is still open; otherwise, use EUpdate.
@@ -3968,12 +3971,23 @@ void Locker::_update_cap_fields(CInode *in, int dirty, const cref_t<MClientCaps>
   ceph_assert(m);
   uint64_t features = m->get_connection()->get_features();
 
-  if (m->get_ctime() > pi->ctime) {
-    dout(7) << "  ctime " << pi->ctime << " -> " << m->get_ctime()
+  /* Dirty caps mean a change is happening now, so rctime must advance now. The
+   * guards below do not fire when the stored value is already ahead of the
+   * client's clock, leaving rctime untouched across a real change. */
+  utime_t now = ceph_clock_now();
+  if (now > pi->rstat.rctime)
+    pi->rstat.rctime = now;
+
+  /* The reported ctime is the client's clock reading, not a user-chosen value:
+   * the setattr args carry no ctime and CEPH_SETATTR_CTIME only asks for a
+   * bump, so nothing can legitimately set ctime ahead of now. */
+  utime_t ctime = mds->clamp_untrusted_timestamp(m->get_ctime());
+  if (ctime > pi->ctime) {
+    dout(7) << "  ctime " << pi->ctime << " -> " << ctime
 	    << " for " << *in << dendl;
-    pi->ctime = m->get_ctime();
-    if (m->get_ctime() > pi->rstat.rctime)
-      pi->rstat.rctime = m->get_ctime();
+    pi->ctime = ctime;
+    if (ctime > pi->rstat.rctime)
+      pi->rstat.rctime = ctime;
   }
 
   if ((features & CEPH_FEATURE_FS_CHANGE_ATTR) &&
@@ -3995,8 +4009,11 @@ void Locker::_update_cap_fields(CInode *in, int dirty, const cref_t<MClientCaps>
       dout(7) << "  mtime " << pi->mtime << " -> " << mtime
 	      << " for " << *in << dendl;
       pi->mtime = mtime;
-      if (mtime > pi->rstat.rctime)
-	pi->rstat.rctime = mtime;
+      /* Unlike ctime, mtime has a setter: utimensat(2) may legitimately place
+       * it ahead, so only its rctime contribution is clamped. */
+      utime_t rctime = mds->clamp_untrusted_timestamp(mtime);
+      if (rctime > pi->rstat.rctime)
+	pi->rstat.rctime = rctime;
     }
     if (in->is_file() &&   // ONLY if regular file
 	size > pi->size) {

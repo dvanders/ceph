@@ -507,6 +507,24 @@ options:
   - mds
   flags:
   - runtime
+- name: mds_client_timestamp_future_slack
+  type: secs
+  level: advanced
+  desc: how far into the future an untrusted timestamp may push rstat.rctime
+  long_desc: rstat.rctime is a recursive maximum propagated to every ancestor and
+    never lowered, so one timestamp far in the future permanently pins the rctime
+    of the whole tree above it and hides later changes from rctime-based change
+    detection. This bounds how far ahead of the MDS clock a client request stamp,
+    a ctime/mtime reported in a cap flush, or an mtime recovered from the object
+    store may reach. It is also the worst-case window in which a later change can
+    still be masked, so keep it just large enough for expected clock skew. mtime
+    is exempt, since utimensat(2) may legitimately set it ahead; only its rctime
+    contribution is clamped.
+  default: 1_min
+  services:
+  - mds
+  flags:
+  - runtime
 - name: mds_early_reply
   type: bool
   level: advanced

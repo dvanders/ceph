@@ -86,6 +86,111 @@ class TestMisc(CephFSTestCase):
         log.info("rctime = {}".format(rctime))
         self.assertGreaterEqual(float(rctime), t - 10)
 
+    def test_rctime_future_timestamp_clamped(self):
+        """
+        That a client timestamp far in the future cannot push rstat.rctime far
+        ahead of the MDS clock. mtime keeps its value, since utimensat(2) may
+        legitimately set it ahead; ctime has no setter and is clamped.
+        """
+
+        slack = 60
+        self.config_set('mds', 'mds_client_timestamp_future_slack', slack)
+
+        # be the only client, so that mount_a is granted CEPH_CAP_FILE_EXCL
+        self.mount_b.umount_wait()
+
+        self.mount_a.run_shell(["mkdir", "-p", "rctime_clamp/sub"])
+
+        # 2100-01-01T00:00:00Z
+        future = 4102444800
+        started = time.time()
+
+        # Hold the file open for write so the client keeps Fx and applies the
+        # utimensat(2) locally; the future mtime then reaches the MDS in a cap
+        # flush, the path that feeds rctime.
+        self.mount_a.run_python(dedent("""
+            import os
+            path = os.path.join("{mnt}", "rctime_clamp", "sub", "f")
+            fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o644)
+            os.write(fd, b"hello")
+            os.utime(path, ns=({future} * 10**9, {future} * 10**9))
+            os.fsync(fd)
+            os.close(fd)
+            """).format(mnt=self.mount_a.mountpoint, future=future))
+
+        # mtime is preserved exactly
+        mtime = self.mount_a.run_shell(
+            ["stat", "-c", "%Y", "rctime_clamp/sub/f"]).stdout.getvalue().strip()
+        self.assertEqual(int(float(mtime)), future)
+
+        # ctime is clamped
+        ctime = float(self.mount_a.run_shell(
+            ["stat", "-c", "%Z", "rctime_clamp/sub/f"]).stdout.getvalue().strip())
+        self.assertLess(ctime, time.time() + slack + 30,
+                        "ctime is {0}, further than "
+                        "mds_client_timestamp_future_slack={1}s into the "
+                        "future".format(ctime, slack))
+
+        # rctime on every ancestor stays bounded; poll until it propagates up,
+        # failing as soon as any ancestor reports an implausible value
+        dirs = [".", "rctime_clamp", "rctime_clamp/sub"]
+        deadline = started + 60
+        propagated = False
+        while time.time() < deadline:
+            rctimes = {d: float(self.mount_a.getfattr(d, "ceph.dir.rctime"))
+                       for d in dirs}
+            bound = time.time() + slack + 30
+            for d, rctime in rctimes.items():
+                self.assertLess(
+                    rctime, bound,
+                    "rctime on {0} is {1}, which is further than "
+                    "mds_client_timestamp_future_slack={2}s into the "
+                    "future".format(d, rctime, slack))
+            if all(rctime >= started for rctime in rctimes.values()):
+                propagated = True
+                break
+            time.sleep(1)
+
+        self.assertTrue(propagated,
+                        "rctime did not propagate to all ancestors in time")
+
+    def test_rctime_advances_on_past_mtime(self):
+        """
+        That setting mtime backwards still advances rctime. It is a change, so a
+        consumer polling rctime has to see it; that requires rctime to follow
+        the MDS clock rather than the timestamp the client reports.
+        """
+
+        self.mount_b.umount_wait()
+        self.mount_a.run_shell(["mkdir", "-p", "rctime_past/sub"])
+        self.mount_a.run_shell(["touch", "rctime_past/sub/f"])
+
+        def rctime(path):
+            return float(self.mount_a.getfattr(path, "ceph.dir.rctime"))
+
+        self.wait_until_true(lambda: rctime("rctime_past/sub") > 0, timeout=60)
+        before = rctime("rctime_past/sub")
+
+        past = 946684800  # 2000-01-01T00:00:00Z
+        self.mount_a.run_python(dedent("""
+            import os
+            path = os.path.join("{mnt}", "rctime_past", "sub", "f")
+            fd = os.open(path, os.O_WRONLY)
+            os.write(fd, b"changed")
+            os.utime(path, ns=({past} * 10**9, {past} * 10**9))
+            os.fsync(fd)
+            os.close(fd)
+            """).format(mnt=self.mount_a.mountpoint, past=past))
+
+        # mtime really did move backwards
+        mtime = self.mount_a.run_shell(
+            ["stat", "-c", "%Y", "rctime_past/sub/f"]).stdout.getvalue().strip()
+        self.assertEqual(int(float(mtime)), past)
+
+        # ...and rctime still advanced up the tree
+        for d in ("rctime_past/sub", "rctime_past"):
+            self.wait_until_true(lambda d=d: rctime(d) > before, timeout=60)
+
     def test_fs_new(self):
         self.mount_a.umount_wait()
         self.mount_b.umount_wait()
