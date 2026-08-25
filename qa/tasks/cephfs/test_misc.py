@@ -191,6 +191,46 @@ class TestMisc(CephFSTestCase):
         for d in ("rctime_past/sub", "rctime_past"):
             self.wait_until_true(lambda d=d: rctime(d) > before, timeout=60)
 
+    def test_rctime_future_corrected_by_touch(self):
+        """
+        That touching a file whose own rctime is in the future corrects it. A
+        file has no children, so its rctime is purely its own and need not be
+        kept as a maximum. Ancestor directories still need a repair scrub.
+        """
+
+        self.mount_b.umount_wait()
+        self.mount_a.run_shell(["mkdir", "-p", "rctime_touch"])
+        path = "rctime_touch/f"
+
+        # store a future rctime on the file, with the clamp wide open so the
+        # reported value is taken as-is
+        self.config_set('mds', 'mds_client_timestamp_future_slack', 10**9)
+        future = 4102444800  # 2100-01-01T00:00:00Z
+        self.mount_a.run_python(dedent("""
+            import os
+            path = os.path.join("{mnt}", "{path}")
+            fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o644)
+            os.write(fd, b"hello")
+            os.utime(path, ns=({future} * 10**9, {future} * 10**9))
+            os.fsync(fd)
+            os.close(fd)
+            """).format(mnt=self.mount_a.mountpoint, path=path, future=future))
+
+        ino = int(self.mount_a.run_shell(
+            ["stat", "-c", "%i", path]).stdout.getvalue().strip())
+
+        def file_rctime():
+            out = self.fs.rank_tell(["dump", "inode", str(ino)])
+            return float(out["inode"]["rstat"]["rctime"])
+
+        self.wait_until_true(lambda: file_rctime() >= future, timeout=60)
+
+        # restore the clamp and touch the file; its rctime must come back
+        self.config_set('mds', 'mds_client_timestamp_future_slack', 60)
+        self.mount_a.run_shell(["touch", path])
+
+        self.wait_until_true(lambda: file_rctime() < future, timeout=60)
+
     def test_fs_new(self):
         self.mount_a.umount_wait()
         self.mount_b.umount_wait()

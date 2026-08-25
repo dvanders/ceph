@@ -3971,12 +3971,11 @@ void Locker::_update_cap_fields(CInode *in, int dirty, const cref_t<MClientCaps>
   ceph_assert(m);
   uint64_t features = m->get_connection()->get_features();
 
-  /* Dirty caps mean a change is happening now, so rctime must advance now. The
-   * guards below do not fire when the stored value is already ahead of the
+  /* Dirty caps mean a change is happening now, so rctime follows the MDS clock.
+   * The guards below do not fire when the stored value is already ahead of the
    * client's clock, leaving rctime untouched across a real change. */
   utime_t now = ceph_clock_now();
-  if (now > pi->rstat.rctime)
-    pi->rstat.rctime = now;
+  in->update_rctime(pi, now);
 
   /* The reported ctime is the client's clock reading, not a user-chosen value:
    * the setattr args carry no ctime and CEPH_SETATTR_CTIME only asks for a

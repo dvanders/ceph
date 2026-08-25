@@ -986,6 +986,15 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
   void _put() override;
 
   // -- hierarchy stuff --
+  /* A non-directory has no children, so its rctime is purely its own and may be
+   * lowered; a directory's is a recursive maximum over its subtree and may not.
+   * Assigning for the former lets a future rctime be corrected by any later
+   * change, rather than being pinned forever. */
+  void update_rctime(mempool_inode *pi, utime_t t) const {
+    if (!is_dir() || t > pi->rstat.rctime)
+      pi->rstat.rctime = t;
+  }
+
   void set_primary_parent(CDentry *p) {
     ceph_assert(parent == 0 ||
 	   g_conf().get_val<bool>("mds_hack_allow_loading_invalid_metadata"));

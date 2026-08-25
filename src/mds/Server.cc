@@ -5656,8 +5656,7 @@ void Server::handle_client_setattr(const MDRequestRef& mdr)
 
   pi.inode->version = cur->pre_dirty();
   pi.inode->ctime = mdr->get_op_stamp();
-  if (mdr->get_op_stamp() > pi.inode->rstat.rctime)
-    pi.inode->rstat.rctime = mdr->get_op_stamp();
+  cur->update_rctime(pi.inode.get(), mdr->get_op_stamp());
   pi.inode->change_attr++;
 
   // log + wait
@@ -5693,8 +5692,7 @@ void Server::do_open_truncate(const MDRequestRef& mdr, int cmode)
   auto pi = in->project_inode(mdr);
   pi.inode->version = in->pre_dirty();
   pi.inode->mtime = pi.inode->ctime = mdr->get_op_stamp();
-  if (mdr->get_op_stamp() > pi.inode->rstat.rctime)
-    pi.inode->rstat.rctime = mdr->get_op_stamp();
+  in->update_rctime(pi.inode.get(), mdr->get_op_stamp());
   pi.inode->change_attr++;
 
   uint64_t old_size = std::max<uint64_t>(pi.inode->size, mdr->client_request->head.args.open.old_size);
@@ -5811,8 +5809,7 @@ void Server::handle_client_setlayout(const MDRequestRef& mdr)
   pi.inode->add_old_pool(old_layout.pool_id);
   pi.inode->version = cur->pre_dirty();
   pi.inode->ctime = mdr->get_op_stamp();
-  if (mdr->get_op_stamp() > pi.inode->rstat.rctime)
-    pi.inode->rstat.rctime = mdr->get_op_stamp();
+  cur->update_rctime(pi.inode.get(), mdr->get_op_stamp());
   pi.inode->change_attr++;
   
   // log + wait
@@ -6841,8 +6838,7 @@ void Server::handle_client_setvxattr(const MDRequestRef& mdr, CInode *cur)
 
   pip->change_attr++;
   pip->ctime = mdr->get_op_stamp();
-  if (mdr->get_op_stamp() > pip->rstat.rctime)
-    pip->rstat.rctime = mdr->get_op_stamp();
+  cur->update_rctime(pip, mdr->get_op_stamp());
   pip->version = cur->pre_dirty();
   if (cur->is_file())
     pip->update_backtrace();
@@ -7118,8 +7114,7 @@ void Server::handle_client_setxattr(const MDRequestRef& mdr)
   auto pi = cur->project_inode(mdr, true);
   pi.inode->version = cur->pre_dirty();
   pi.inode->ctime = mdr->get_op_stamp();
-  if (mdr->get_op_stamp() > pi.inode->rstat.rctime)
-    pi.inode->rstat.rctime = mdr->get_op_stamp();
+  cur->update_rctime(pi.inode.get(), mdr->get_op_stamp());
   pi.inode->change_attr++;
   pi.inode->xattr_version++;
 
@@ -7192,8 +7187,7 @@ void Server::handle_client_removexattr(const MDRequestRef& mdr)
   auto pi = cur->project_inode(mdr, true);
   pi.inode->version = cur->pre_dirty();
   pi.inode->ctime = mdr->get_op_stamp();
-  if (mdr->get_op_stamp() > pi.inode->rstat.rctime)
-    pi.inode->rstat.rctime = mdr->get_op_stamp();
+  cur->update_rctime(pi.inode.get(), mdr->get_op_stamp());
   pi.inode->change_attr++;
   pi.inode->xattr_version++;
   std::invoke(handler->removexattr, this, cur, pi.xattrs, xattr_op);
@@ -7920,8 +7914,7 @@ void Server::_link_local(const MDRequestRef& mdr, CDentry *dn, CInode *targeti, 
   auto pi = targeti->project_inode(mdr);
   pi.inode->nlink++;
   pi.inode->ctime = mdr->get_op_stamp();
-  if (mdr->get_op_stamp() > pi.inode->rstat.rctime)
-    pi.inode->rstat.rctime = mdr->get_op_stamp();
+  targeti->update_rctime(pi.inode.get(), mdr->get_op_stamp());
   pi.inode->change_attr++;
   pi.inode->version = tipv;
 
@@ -8667,8 +8660,7 @@ void Server::_unlink_local(const MDRequestRef& mdr, CDentry *dn, CDentry *strayd
   }
   pi.inode->version = in->pre_dirty();
   pi.inode->ctime = mdr->get_op_stamp();
-  if (mdr->get_op_stamp() > pi.inode->rstat.rctime)
-    pi.inode->rstat.rctime = mdr->get_op_stamp();
+  in->update_rctime(pi.inode.get(), mdr->get_op_stamp());
   pi.inode->change_attr++;
   pi.inode->nlink--;
   if (pi.inode->nlink == 0)
@@ -9962,16 +9954,14 @@ void Server::_rename_prepare(const MDRequestRef& mdr,
   if (!silent) {
     if (spi) {
       spi->ctime = mdr->get_op_stamp();
-      if (mdr->get_op_stamp() > spi->rstat.rctime)
-	spi->rstat.rctime = mdr->get_op_stamp();
+      srci->update_rctime(spi, mdr->get_op_stamp());
       spi->change_attr++;
       if (linkmerge)
 	spi->nlink--;
     }
     if (tpi) {
       tpi->ctime = mdr->get_op_stamp();
-      if (mdr->get_op_stamp() > tpi->rstat.rctime)
-	tpi->rstat.rctime = mdr->get_op_stamp();
+      oldin->update_rctime(tpi, mdr->get_op_stamp());
       tpi->change_attr++;
       {
         std::string t;
@@ -11602,8 +11592,7 @@ void Server::handle_client_mksnap(const MDRequestRef& mdr)
 
   auto pi = diri->project_inode(mdr, false, true);
   pi.inode->ctime = info.stamp;
-  if (info.stamp > pi.inode->rstat.rctime)
-    pi.inode->rstat.rctime = info.stamp;
+  diri->update_rctime(pi.inode.get(), info.stamp);
   pi.inode->rstat.rsnaps++;
   pi.inode->version = diri->pre_dirty();
 
@@ -11739,8 +11728,7 @@ void Server::handle_client_rmsnap(const MDRequestRef& mdr)
   auto pi = diri->project_inode(mdr, false, true);
   pi.inode->version = diri->pre_dirty();
   pi.inode->ctime = mdr->get_op_stamp();
-  if (mdr->get_op_stamp() > pi.inode->rstat.rctime)
-    pi.inode->rstat.rctime = mdr->get_op_stamp();
+  diri->update_rctime(pi.inode.get(), mdr->get_op_stamp());
   pi.inode->rstat.rsnaps--;
   
   mdr->ls = mdlog->get_current_segment();
@@ -11880,8 +11868,7 @@ void Server::handle_client_renamesnap(const MDRequestRef& mdr)
   // journal
   auto pi = diri->project_inode(mdr, false, true);
   pi.inode->ctime = mdr->get_op_stamp();
-  if (mdr->get_op_stamp() > pi.inode->rstat.rctime)
-    pi.inode->rstat.rctime = mdr->get_op_stamp();
+  diri->update_rctime(pi.inode.get(), mdr->get_op_stamp());
   pi.inode->version = diri->pre_dirty();
 
   // project the snaprealm
@@ -12015,8 +12002,7 @@ void Server::handle_client_snap_md_op(const MDRequestRef& mdr)
   // project the inode.
   auto pi = diri->project_inode(mdr, false, true);
   pi.inode->ctime = mdr->get_op_stamp();
-  if (mdr->get_op_stamp() > pi.inode->rstat.rctime)
-    pi.inode->rstat.rctime = mdr->get_op_stamp();
+  diri->update_rctime(pi.inode.get(), mdr->get_op_stamp());
   pi.inode->version = diri->pre_dirty();
 
   // update snap md.

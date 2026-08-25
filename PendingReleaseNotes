@@ -1169,3 +1169,10 @@ Relevant tracker: https://tracker.ceph.com/issues/71677
   Note that this does not repair trees whose ``rctime`` is already poisoned:
   because ``rctime`` never decreases, existing values persist until a change with
   a later timestamp supersedes them.
+
+* CephFS: A file whose ``rstat.rctime`` is in the future can now be corrected by
+  touching it. A non-directory has no children, so its ``rctime`` is purely its
+  own and need not be kept as a maximum; it is now assigned on every change
+  rather than only raised. Ancestor directories still hold a maximum over their
+  subtree and cannot be lowered this way -- correcting those needs a repair
+  scrub with ``mds_scrub_repair_future_rctime``.
