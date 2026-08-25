@@ -13639,6 +13639,23 @@ void MDCache::repair_dirfrag_stats_work(const MDRequestRef& mdr)
   mds->mdlog->submit_entry(le, new C_MDC_RespondInternalRequest(this, mdr));
 }
 
+void MDCache::check_future_rctime(inodeno_t ino, utime_t rctime)
+{
+  if (mds->clamp_untrusted_timestamp(rctime) == rctime)
+    return;
+  future_rctime_count++;
+  future_rctime_ino = ino;
+  future_rctime_last = ceph_clock_now();
+  dout(5) << __func__ << " " << ino << " (" << future_rctime_count
+	  << " seen)" << dendl;
+}
+
+bool MDCache::have_future_rctime() const
+{
+  return future_rctime_count &&
+    ceph_clock_now() - future_rctime_last < FUTURE_RCTIME_REPORT_FOR;
+}
+
 void MDCache::repair_inode_stats(CInode *diri)
 {
   MDRequestRef mdr = request_start_internal(CEPH_MDS_OP_REPAIR_INODESTATS);

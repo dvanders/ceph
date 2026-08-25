@@ -1190,3 +1190,10 @@ Relevant tracker: https://tracker.ceph.com/issues/71677
   Scrub recomputes a directory's ``rstat`` from its children's
   ``accounted_rstat``, so correct the files first -- touching one now corrects
   its own ``rctime`` -- then run the scrub to bring the directories down.
+
+* CephFS: New ``MDS_FUTURE_RCTIME`` health warning, raised when the MDS sees an
+  inode whose ``rstat.rctime`` exceeds anything its children or its own ``ctime``
+  can explain. Such an ``rctime`` is stuck ahead of real time and no longer
+  advances on change, so changes beneath it are invisible to ``rctime``-based
+  tools. The warning lapses after an hour without a further sighting, so a
+  successful repair clears it.

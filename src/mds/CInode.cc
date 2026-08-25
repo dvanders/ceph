@@ -2840,6 +2840,11 @@ void CInode::finish_scatter_gather_update(int type, MutationRef& mut)
 	}
       }
 
+      /* A consistent tree can still be uniformly stuck ahead of real time, so
+       * this is a comparison against the clock rather than against the
+       * recomputed value. */
+      mdcache->check_future_rctime(ino(), pi->rstat.rctime);
+
       mdcache->broadcast_quota_to_client(this);
     }
     break;

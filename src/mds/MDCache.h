@@ -1150,6 +1150,15 @@ private:
   void enqueue_scrub(std::string_view path, std::string_view tag,
                      bool force, bool recursive, bool repair,
                      bool scrub_mdsdir, Formatter *f, Context *fin);
+  /* An rctime ahead of the MDS clock by more than the clamp allows no longer
+   * advances on change, hiding changes from rctime-based tools. Recorded for a
+   * health warning, which lapses once nothing has been seen for a while so
+   * that a repair clears it. */
+  void check_future_rctime(inodeno_t ino, utime_t rctime);
+  bool have_future_rctime() const;
+  uint64_t get_future_rctime_count() const { return future_rctime_count; }
+  inodeno_t get_future_rctime_ino() const { return future_rctime_ino; }
+
   void repair_inode_stats(CInode *diri);
   void repair_dirfrag_stats(CDir *dir);
   void rdlock_dirfrags_stats(CInode *diri, MDSInternalContext *fin);
@@ -1356,6 +1365,11 @@ private:
    * long time)
    */
   void enqueue_scrub_work(const MDRequestRef& mdr);
+  static constexpr double FUTURE_RCTIME_REPORT_FOR = 3600.0;
+  uint64_t future_rctime_count = 0;
+  inodeno_t future_rctime_ino;
+  utime_t future_rctime_last;
+
   void repair_inode_stats_work(const MDRequestRef& mdr);
   void repair_dirfrag_stats_work(const MDRequestRef& mdr);
   void rdlock_dirfrags_stats_work(const MDRequestRef& mdr);

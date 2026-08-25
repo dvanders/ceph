@@ -54,12 +54,14 @@ enum mds_metric_t {
   MDS_HEALTH_CLIENTS_BROKEN_ROOTSQUASH,
   MDS_HEALTH_ESTIMATED_REPLAY_TIME,
   MDS_HEALTH_DUMMY, // not a real health warning, for testing
+  MDS_HEALTH_FUTURE_RCTIME,
 };
 
 inline const char *mds_metric_name(mds_metric_t m)
 {
   switch (m) {
   case MDS_HEALTH_TRIM: return "MDS_TRIM";
+  case MDS_HEALTH_FUTURE_RCTIME: return "MDS_FUTURE_RCTIME";
   case MDS_HEALTH_CLIENT_RECALL: return "MDS_CLIENT_RECALL";
   case MDS_HEALTH_CLIENT_LATE_RELEASE: return "MDS_CLIENT_LATE_RELEASE";
   case MDS_HEALTH_CLIENT_RECALL_MANY: return "MDS_CLIENT_RECALL_MANY";

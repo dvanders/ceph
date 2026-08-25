@@ -173,6 +173,21 @@ other daemons, please see :ref:`health-checks`.
     This message appears if any client requests have taken longer than
     ``mds_op_complaint_time`` (default 30s).
 
+``MDS_FUTURE_RCTIME``
+---------------------
+
+  Message
+    "N inodes have an rctime in the future"
+  Description
+    The MDS has seen inodes whose ``rstat.rctime`` exceeds anything their
+    children or their own ``ctime`` can explain, so it is stuck ahead of real
+    time. Because ``rctime`` is a maximum, such a value stops advancing on
+    change, and tools that use it to find what changed -- incremental backup, or
+    anything pruning unchanged subtrees -- silently miss changes beneath it. The
+    usual cause is a client that once wrote a timestamp far in the future. See
+    :doc:`/cephfs/scrub` for the repair procedure. The warning lapses once
+    nothing further has been seen for an hour, so a repair clears it.
+
 ``MDS_CACHE_OVERSIZED``
 -----------------------
 

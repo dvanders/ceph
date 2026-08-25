@@ -231,6 +231,37 @@ class TestMisc(CephFSTestCase):
 
         self.wait_until_true(lambda: file_rctime() < future, timeout=60)
 
+    def test_rctime_future_health_warning(self):
+        """
+        That an rctime stuck ahead of real time raises MDS_FUTURE_RCTIME, so an
+        operator learns that a repair is needed.
+        """
+
+        self.mount_b.umount_wait()
+        self.mount_a.run_shell(["mkdir", "-p", "rctime_warn/sub"])
+
+        # store a future rctime with the clamp wide open, then restore it, so
+        # the value left behind is no longer reachable by real changes
+        self.config_set('mds', 'mds_client_timestamp_future_slack', 10**9)
+        future = 4102444800  # 2100-01-01T00:00:00Z
+        self.mount_a.run_python(dedent("""
+            import os
+            path = os.path.join("{mnt}", "rctime_warn", "sub", "f")
+            fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o644)
+            os.write(fd, b"hello")
+            os.utime(path, ns=({future} * 10**9, {future} * 10**9))
+            os.fsync(fd)
+            os.close(fd)
+            """).format(mnt=self.mount_a.mountpoint, future=future))
+        self.config_set('mds', 'mds_client_timestamp_future_slack', 60)
+
+        # keep the directories busy so their nest scatterlocks settle, which is
+        # where the MDS notices
+        for i in range(5):
+            self.mount_a.run_shell(["touch", "rctime_warn/sub/g%d" % i])
+
+        self.wait_for_health("MDS_FUTURE_RCTIME", timeout=120)
+
     def test_fs_new(self):
         self.mount_a.umount_wait()
         self.mount_b.umount_wait()

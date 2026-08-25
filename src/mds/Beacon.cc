@@ -477,6 +477,18 @@ void Beacon::notify_health(MDSRank const *mds)
     }
   }
 
+  // Report inodes whose rctime is stuck ahead of real time
+  if (mds->mdcache->have_future_rctime()) {
+    CachedStackStringStream css;
+    *css << mds->mdcache->get_future_rctime_count()
+	 << " inodes have an rctime in the future (most recently "
+	 << mds->mdcache->get_future_rctime_ino()
+	 << "); changes below them may be invisible to rctime-based tools."
+	 << " See the CephFS scrub documentation for the repair procedure.";
+    MDSHealthMetric m(MDS_HEALTH_FUTURE_RCTIME, HEALTH_WARN, css->strv());
+    health.metrics.push_back(m);
+  }
+
   // Report a health warning if we are readonly
   if (mds->mdcache->is_readonly()) {
     MDSHealthMetric m(MDS_HEALTH_READ_ONLY, HEALTH_WARN,
