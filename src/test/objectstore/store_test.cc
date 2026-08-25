@@ -1212,6 +1212,93 @@ TEST_P(StoreTest, SmallBlockWrites) {
   }
 }
 
+TEST_P(StoreTest, PageCacheReadTest) {
+  // bluestore_page_cache_read routes object data reads through the
+  // non-O_DIRECT descriptor so the kernel page cache can serve repeats. Its
+  // correctness rests on an O_DIRECT write invalidating the page cache pages
+  // it supersedes, so read back across a remount, which empties BlueStore's
+  // own caches and forces the read to actually reach the device.
+  if (string(GetParam()) != "bluestore")
+    return;
+
+  auto bookmark = BookmarkSettings();
+  SetVal(g_conf(), "bluestore_page_cache_read", "true");
+  g_conf().apply_changes(nullptr);
+
+  int r;
+  coll_t cid;
+  ghobject_t hoid(hobject_t(sobject_t("Object 1", CEPH_NOSNAP)));
+  auto ch = store->create_new_collection(cid);
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+
+  const size_t len = 0x10000;
+  bufferlist first;
+  first.append(std::string(len, 'a'));
+  {
+    ObjectStore::Transaction t;
+    t.write(cid, hoid, 0, first.length(), first);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+
+  ch.reset(nullptr);
+  CloseAndReopen();
+  ch = store->open_collection(cid);
+  ASSERT_TRUE(ch);
+  {
+    bufferlist in;
+    r = store->read(ch, hoid, 0, len, in);
+    ASSERT_EQ(r, (int)len);
+    ASSERT_TRUE(in.contents_equal(first));
+  }
+
+  // overwrite the same range and make sure the previous contents cannot come
+  // back out of the page cache
+  bufferlist second;
+  second.append(std::string(len, 'b'));
+  {
+    ObjectStore::Transaction t;
+    t.write(cid, hoid, 0, second.length(), second);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+
+  ch.reset(nullptr);
+  CloseAndReopen();
+  ch = store->open_collection(cid);
+  ASSERT_TRUE(ch);
+  {
+    bufferlist in;
+    r = store->read(ch, hoid, 0, len, in);
+    ASSERT_EQ(r, (int)len);
+    ASSERT_FALSE(in.contents_equal(first))
+        << "read returned stale data from the page cache after an overwrite";
+    ASSERT_TRUE(in.contents_equal(second));
+  }
+
+  // a partial read of a range already in the page cache must still be correct
+  {
+    bufferlist in, expected;
+    r = store->read(ch, hoid, 0x1000, 0x2000, in);
+    ASSERT_EQ(r, 0x2000);
+    expected.append(std::string(0x2000, 'b'));
+    ASSERT_TRUE(in.contents_equal(expected));
+  }
+
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, hoid);
+    t.remove_collection(cid);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+}
+
 TEST_P(StoreTest, BufferCacheReadTest) {
   int r;
   coll_t cid;
