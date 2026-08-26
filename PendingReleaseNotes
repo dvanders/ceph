@@ -30,6 +30,12 @@
   a few times in random workloads.  ``mds_dir_prefetch_backend_max`` (default 1)
   limits the number of concurrent background fetches.  This reduces latency in
   large directories while retaining cache warmth for hot directories.
+* MGR: ``ceph device ls`` no longer shows ``now`` for every device whose
+  predicted failure window has opened. An open window now shows the time left
+  until its upper bound, an expired one shows ``overdue``, and an open-ended
+  window whose lower bound has passed shows nothing. Previously even healthy
+  devices could show ``now``.
+
 * MGR: The ``mgr/devicehealth/mark_out_threshold`` and
   ``mgr/devicehealth/warn_threshold`` defaults are now 14 and 42 days (were 28
   and 84), matching the two- and six-week bands the failure predictors report.

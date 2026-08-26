@@ -96,12 +96,26 @@ TEST_F(DeviceStateTest, GetLifeExpectancyStr)
 
   ASSERT_EQ(result, "");
 
+  // an open window reports the time left until its upper bound
   utime_t from(1000, 0);
-  utime_t to(1400, 0);
+  utime_t to(1800, 0);
   device->set_life_expectancy(from, to, now);
   result = device->get_life_expectancy_str(now);
 
-  ASSERT_EQ(result, "now");
+  ASSERT_EQ(result, "<5m");
+
+  // a window that has closed is overdue
+  to = utime_t(1400, 0);
+  device->set_life_expectancy(from, to, now);
+  result = device->get_life_expectancy_str(now);
+
+  ASSERT_EQ(result, "overdue");
+
+  // an open-ended window whose lower bound has passed reports nothing
+  device->set_life_expectancy(from, utime_t(), now);
+  result = device->get_life_expectancy_str(now);
+
+  ASSERT_EQ(result, "");
 
   from = utime_t(2000, 0);
   to = utime_t(3000, 0);

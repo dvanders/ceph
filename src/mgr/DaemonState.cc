@@ -111,20 +111,30 @@ string DeviceState::get_life_expectancy_str(utime_t now) const
   if (life_expectancy.first == utime_t()) {
     return string();
   }
-  if (now >= life_expectancy.first) {
-    return "now";
+  if (now < life_expectancy.first) {
+    utime_t min = life_expectancy.first - now;
+    if (life_expectancy.second == utime_t()) {
+      return string(">") + timespan_str(make_timespan(min));
+    }
+    utime_t max = life_expectancy.second - now;
+    string a = timespan_str(make_timespan(min));
+    string b = timespan_str(make_timespan(max));
+    if (a == b) {
+      return a;
+    }
+    return a + " to " + b;
   }
-  utime_t min = life_expectancy.first - now;
-  utime_t max = life_expectancy.second - now;
+  // The window has opened.  An open-ended window ("at least this long") has
+  // simply expired.
   if (life_expectancy.second == utime_t()) {
-    return string(">") + timespan_str(make_timespan(min));
+    return string();
   }
-  string a = timespan_str(make_timespan(min));
-  string b = timespan_str(make_timespan(max));
-  if (a == b) {
-    return a;
+  // Inside a bounded window, report the time left until the upper bound.
+  if (now < life_expectancy.second) {
+    return string("<") +
+      timespan_str(make_timespan(life_expectancy.second - now));
   }
-  return a + " to " + b;
+  return "overdue";
 }
 
 void DeviceState::dump(Formatter *f) const
