@@ -357,6 +357,14 @@ class NetworkStack {
   ceph::spinlock pool_spin;
   bool started = false;
 
+  /**
+   * Number of workers at the front of `workers` that get_worker() is allowed to
+   * hand out.  The pool itself is sized once at startup (see
+   * ms_async_max_op_threads); this is the ms_async_op_threads subset of it.
+   * Zero until the pool has been populated.
+   */
+  std::atomic<unsigned> num_active_workers = {0};
+
   std::function<void ()> add_thread(Worker* w);
 
   virtual Worker* create_worker(CephContext *c, unsigned i) = 0;
@@ -392,6 +400,12 @@ class NetworkStack {
   virtual bool support_local_listen_table() const { return false; }
   virtual bool nonblock_connect_need_writable_event() const { return true; }
 
+  // backends that pin workers to a fixed resource -- dpdk assigns each worker a
+  // core out of ms_dpdk_coremask -- can't have spare workers sitting around, so
+  // they opt out of the ms_async_max_op_threads headroom and keep the pool sized
+  // to ms_async_op_threads as it was before.
+  virtual bool support_dynamic_worker_count() const { return true; }
+
   void start();
   void stop();
   virtual Worker *get_worker();
@@ -399,9 +413,16 @@ class NetworkStack {
     return workers[worker_id];
   }
   void drain();
+  /// total number of workers in the pool, fixed at startup
   unsigned get_num_worker() const {
     return workers.size();
   }
+  /// number of workers currently eligible to receive new connections
+  unsigned get_num_active_worker() const {
+    return num_active_workers.load(std::memory_order_relaxed);
+  }
+  /// recompute the active worker count from ms_async_op_threads
+  void update_num_active_workers();
 
   // direct is used in tests only
   virtual void spawn_worker(std::function<void ()> &&) = 0;

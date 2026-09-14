@@ -1402,6 +1402,29 @@ options:
   desc: Log level at which to hexdump corrupt messages we receive
   default: 1
   with_legacy: true
+# size of the worker pool created on init; ms_async_op_threads picks how much of
+# it is used, and unlike this it can be changed at runtime
+- name: ms_async_max_op_threads
+  type: uint
+  level: advanced
+  desc: Number of AsyncMessenger worker threads to create at startup (ms_type=async)
+  long_desc: This is the size of the worker pool that is actually created, and it can
+    only be changed by restarting the daemon.  ms_async_op_threads selects how many
+    of those workers are handed out to new connections, and unlike this option it can
+    be changed at runtime anywhere in the range [1, ms_async_max_op_threads].  Workers
+    above the active count sit idle in their event loop, costing a thread and roughly
+    a quarter of a megabyte each, so the headroom is not free -- but it is what makes
+    ms_async_op_threads adjustable without a restart.  If ms_async_op_threads is
+    configured higher than this value at startup, it wins and the pool is sized to it.
+  fmt_desc: Number of worker threads created at startup by each Async Messenger
+    instance.  ``ms_async_op_threads`` may be tuned at runtime up to this value.
+  default: 8
+  min: 1
+  max: 24
+  flags:
+  - startup
+  see_also:
+  - ms_async_op_threads
 # number of worker processing threads for async messenger created on init
 - name: ms_async_op_threads
   type: uint

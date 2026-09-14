@@ -30,6 +30,8 @@
 #include "common/dout.h"
 #include "include/ceph_assert.h"
 
+#include <algorithm>
+
 #define dout_subsys ceph_subsys_ms
 #undef dout_prefix
 #define dout_prefix *_dout << "stack "
@@ -85,7 +87,19 @@ std::shared_ptr<NetworkStack> NetworkStack::create(CephContext *c,
     return nullptr;
   }
   
+  // The pool is sized once, here, and never resized: a Worker owns an
+  // EventCenter and the connections bound to it, so adding or removing one
+  // underneath live connections isn't something we can do safely.  Create
+  // ms_async_max_op_threads of them so that ms_async_op_threads -- which
+  // selects how many are handed out by get_worker() -- has room to move.  Note
+  // that we're generally called from the bootstrap MonClient's messenger, i.e.
+  // before the monitor configuration database has been fetched, so the pool
+  // size can only ever come from ceph.conf.
   unsigned num_workers = c->_conf->ms_async_op_threads;
+  if (stack->support_dynamic_worker_count()) {
+    num_workers = std::max<unsigned>(
+      num_workers, c->_conf.get_val<uint64_t>("ms_async_max_op_threads"));
+  }
   ceph_assert(num_workers > 0);
   if (num_workers >= EventCenter::MAX_EVENTCENTER) {
     ldout(c, 0) << __func__ << " max thread limit is "
@@ -102,6 +116,7 @@ std::shared_ptr<NetworkStack> NetworkStack::create(CephContext *c,
       throw std::system_error(-ret, std::generic_category());
     stack->workers.push_back(w);
   }
+  stack->update_num_active_workers();
 
   return stack;
 }
@@ -109,6 +124,35 @@ std::shared_ptr<NetworkStack> NetworkStack::create(CephContext *c,
 NetworkStack::NetworkStack(CephContext *c)
   : cct(c)
 {}
+
+void NetworkStack::update_num_active_workers()
+{
+  const unsigned wanted = cct->_conf.get_val<uint64_t>("ms_async_op_threads");
+  unsigned pool_size, active, was;
+
+  {
+    std::lock_guard lk(pool_spin);
+    if (workers.empty()) {
+      // create() calls us again once the pool exists
+      return;
+    }
+    pool_size = workers.size();
+    active = std::clamp<unsigned>(wanted, 1, pool_size);
+    was = num_active_workers.exchange(active, std::memory_order_relaxed);
+  }
+
+  if (was == active) {
+    return;
+  }
+  ldout(cct, 1) << __func__ << " ms_async_op_threads " << was << " -> " << active
+                << " (pool has " << pool_size << " workers)" << dendl;
+  if (wanted > pool_size) {
+    lderr(cct) << __func__ << " ms_async_op_threads " << wanted
+               << " exceeds the " << pool_size << " worker threads created at"
+               << " startup; raise ms_async_max_op_threads and restart the"
+               << " daemon to go higher" << dendl;
+  }
+}
 
 void NetworkStack::start()
 {
@@ -143,7 +187,19 @@ Worker* NetworkStack::get_worker()
   // find worker with least references
   // tempting case is returning on references == 0, but in reality
   // this will happen so rarely that there's no need for special case.
-  for (Worker* worker : workers) {
+  //
+  // Only the first get_num_active_worker() entries are candidates: the rest of
+  // the pool is headroom for a later ms_async_op_threads increase.  Lowering the
+  // active count doesn't move connections off the workers above it, it just
+  // stops feeding them, so they drain as their connections are reopened.
+  unsigned num_active = get_num_active_worker();
+  if (num_active == 0 || num_active > workers.size()) {
+    // not configured yet; fall back to the whole pool
+    num_active = workers.size();
+  }
+  ceph_assert(num_active > 0);
+  for (unsigned i = 0; i < num_active; ++i) {
+    Worker* worker = workers[i];
     unsigned worker_load = worker->references.load();
     if (worker_load < min_load) {
       current_best = worker;

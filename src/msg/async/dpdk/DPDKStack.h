@@ -262,6 +262,9 @@ class DPDKStack : public NetworkStack {
     funcs.reserve(cct->_conf->ms_async_op_threads);
   }
   virtual bool support_local_listen_table() const override { return true; }
+  // each DPDK worker is pinned to a core out of ms_dpdk_coremask, so we can't
+  // create spare ones; keep the pool sized to ms_async_op_threads.
+  virtual bool support_dynamic_worker_count() const override { return false; }
 
   virtual void spawn_worker(std::function<void ()> &&func) override;
   virtual void join_worker(unsigned i) override;
