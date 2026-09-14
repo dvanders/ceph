@@ -27,6 +27,7 @@
 
 #include "acconfig.h"
 #include "common/config_obs.h"
+#include "common/options.h"
 #include "include/Context.h"
 #include "msg/async/Event.h"
 #include "msg/async/Stack.h"
@@ -1042,6 +1043,162 @@ TEST_P(NetworkWorkerTest, StressTest) {
   ASSERT_EQ(0, factory.message_left);
 }
 
+
+// The worker pool is built once, at NetworkStack::create() time, from
+// ms_async_max_op_threads; ms_async_op_threads then picks how much of it
+// get_worker() is allowed to use, and that part moves at runtime.  These tests
+// don't need sockets, only the bookkeeping, so they build their own stacks
+// rather than using the NetworkWorkerTest fixture.
+class NetworkStackWorkerCountTest : public ::testing::Test {
+ public:
+  std::shared_ptr<NetworkStack> stack;
+
+  // ms_async_max_op_threads is startup-only, so md_config_t would refuse to
+  // change it now that the threads are running -- unless something claims to be
+  // watching it.  Deliberately *not* tracking ms_async_op_threads: that one has
+  // to get in on its own merits, which is what half of these tests are about.
+  NoopConfigObserver fake_obs = {{"ms_async_max_op_threads"s}};
+
+  void SetUp() override {
+    g_ceph_context->_conf.add_observer(&fake_obs);
+  }
+
+  void TearDown() override {
+    if (stack) {
+      stack->stop();
+      stack.reset();
+    }
+    // drop whatever we pushed in, by either route
+    g_ceph_context->_conf.set_mon_vals(g_ceph_context, {}, nullptr);
+    g_ceph_context->_conf.rm_val("ms_async_op_threads");
+    g_ceph_context->_conf.rm_val("ms_async_max_op_threads");
+    g_ceph_context->_conf.apply_changes(nullptr);
+    g_ceph_context->_conf.remove_observer(&fake_obs);
+  }
+
+  // What a daemon would have read out of ceph.conf before it came up.  These
+  // land at CONF_OVERRIDE, which outranks CONF_MON -- just as ceph.conf does --
+  // so pass a null op_threads in any test that then wants to drive the option
+  // from the monitor.
+  void create_stack(const char *op_threads, const char *max_op_threads) {
+    if (op_threads) {
+      g_ceph_context->_conf.set_val_or_die("ms_async_op_threads", op_threads);
+    }
+    g_ceph_context->_conf.set_val_or_die("ms_async_max_op_threads",
+					 max_op_threads);
+    g_ceph_context->_conf.apply_changes(nullptr);
+    stack = NetworkStack::create(g_ceph_context, "posix");
+    stack->start();
+  }
+
+  // what `ceph config set <who> <key> <value>` eventually does to a daemon
+  void mon_set(const char *key, const char *value) {
+    ASSERT_EQ(0, g_ceph_context->_conf.set_mon_vals(
+		   g_ceph_context, {{key, value}}, nullptr));
+  }
+};
+
+TEST_F(NetworkStackWorkerCountTest, OptionFlags) {
+  const Option *o = g_ceph_context->_conf.get_schema("ms_async_op_threads");
+  ASSERT_NE(nullptr, o);
+  EXPECT_TRUE(o->has_flag(Option::FLAG_RUNTIME));
+  EXPECT_TRUE(o->can_update_at_runtime());
+
+  o = g_ceph_context->_conf.get_schema("ms_async_max_op_threads");
+  ASSERT_NE(nullptr, o);
+  EXPECT_TRUE(o->has_flag(Option::FLAG_STARTUP));
+  // so that `ceph config dump` marks it as needing a restart
+  EXPECT_FALSE(o->can_update_at_runtime());
+}
+
+TEST_F(NetworkStackWorkerCountTest, PoolIsSizedByMaxOpThreads) {
+  create_stack("3", "6");
+  EXPECT_EQ(6u, stack->get_num_worker());
+  EXPECT_EQ(3u, stack->get_num_active_worker());
+}
+
+TEST_F(NetworkStackWorkerCountTest, OpThreadsAboveMaxEnlargesPool) {
+  // setting ms_async_op_threads in ceph.conf still works the way it always did
+  create_stack("7", "4");
+  EXPECT_EQ(7u, stack->get_num_worker());
+  EXPECT_EQ(7u, stack->get_num_active_worker());
+}
+
+TEST_F(NetworkStackWorkerCountTest, MonConfigChangeMovesActiveCount) {
+  create_stack(nullptr, "6");
+  ASSERT_EQ(6u, stack->get_num_worker());
+
+  mon_set("ms_async_op_threads", "2");
+  EXPECT_EQ(2u, stack->get_num_active_worker());
+  EXPECT_EQ(6u, stack->get_num_worker());
+
+  mon_set("ms_async_op_threads", "5");
+  EXPECT_EQ(5u, stack->get_num_active_worker());
+  EXPECT_EQ(6u, stack->get_num_worker());
+
+  mon_set("ms_async_op_threads", "1");
+  EXPECT_EQ(1u, stack->get_num_active_worker());
+  EXPECT_EQ(6u, stack->get_num_worker());
+}
+
+TEST_F(NetworkStackWorkerCountTest, ActiveCountIsClampedToPool) {
+  create_stack(nullptr, "4");
+  ASSERT_EQ(4u, stack->get_num_worker());
+
+  // more than exists: clamped, not honoured, and certainly not a new worker
+  mon_set("ms_async_op_threads", "9");
+  EXPECT_EQ(4u, stack->get_num_active_worker());
+  EXPECT_EQ(4u, stack->get_num_worker());
+
+  mon_set("ms_async_op_threads", "2");
+  EXPECT_EQ(2u, stack->get_num_active_worker());
+  EXPECT_EQ(4u, stack->get_num_worker());
+}
+
+// ms_async_op_threads is an ordinary option, so ceph.conf still outranks the
+// monitor.  Anyone who already worked around this by putting the option in
+// their conf -- with cephadm, `ceph cephadm set-extra-ceph-conf` -- has to take
+// it back out before `ceph config set` will do anything.
+TEST_F(NetworkStackWorkerCountTest, CephConfValueOutranksTheMonitor) {
+  create_stack("2", "6");
+  ASSERT_EQ(6u, stack->get_num_worker());
+  ASSERT_EQ(2u, stack->get_num_active_worker());
+
+  mon_set("ms_async_op_threads", "5");
+  EXPECT_EQ(2u, stack->get_num_active_worker());
+
+  // drop the higher-precedence value and the monitor's finally takes
+  g_ceph_context->_conf.rm_val("ms_async_op_threads");
+  g_ceph_context->_conf.apply_changes(nullptr);
+  EXPECT_EQ(5u, stack->get_num_active_worker());
+}
+
+TEST_F(NetworkStackWorkerCountTest, GetWorkerHonoursActiveCount) {
+  create_stack(nullptr, "4");
+  ASSERT_EQ(4u, stack->get_num_worker());
+
+  mon_set("ms_async_op_threads", "1");
+  ASSERT_EQ(1u, stack->get_num_active_worker());
+
+  // three workers exist but are off limits
+  for (int i = 0; i < 20; ++i) {
+    ASSERT_EQ(0u, stack->get_worker()->id);
+  }
+
+  mon_set("ms_async_op_threads", "4");
+  ASSERT_EQ(4u, stack->get_num_active_worker());
+
+  // the headroom is now reachable.  get_worker() hands out the least loaded
+  // worker, so the 20 references already parked on worker 0 get worked off
+  // before it comes back into rotation -- 100 draws is plenty for all four.
+  std::set<unsigned> seen;
+  for (int i = 0; i < 100; ++i) {
+    Worker *w = stack->get_worker();
+    ASSERT_LT(w->id, 4u);
+    seen.insert(w->id);
+  }
+  EXPECT_EQ((std::set<unsigned>{0, 1, 2, 3}), seen);
+}
 
 INSTANTIATE_TEST_SUITE_P(
   NetworkStack,
