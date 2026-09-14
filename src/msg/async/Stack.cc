@@ -32,6 +32,8 @@
 
 #include <algorithm>
 
+using namespace std::literals;
+
 #define dout_subsys ceph_subsys_ms
 #undef dout_prefix
 #define dout_prefix *_dout << "stack "
@@ -91,10 +93,11 @@ std::shared_ptr<NetworkStack> NetworkStack::create(CephContext *c,
   // EventCenter and the connections bound to it, so adding or removing one
   // underneath live connections isn't something we can do safely.  Create
   // ms_async_max_op_threads of them so that ms_async_op_threads -- which
-  // selects how many are handed out by get_worker() -- has room to move.  Note
-  // that we're generally called from the bootstrap MonClient's messenger, i.e.
-  // before the monitor configuration database has been fetched, so the pool
-  // size can only ever come from ceph.conf.
+  // selects how many are handed out by get_worker() -- can be retuned at
+  // runtime without a restart.  Note that we're generally called from the
+  // bootstrap MonClient's messenger, i.e. before the monitor configuration
+  // database has been fetched, so the pool size can only ever come from
+  // ceph.conf.
   unsigned num_workers = c->_conf->ms_async_op_threads;
   if (stack->support_dynamic_worker_count()) {
     num_workers = std::max<unsigned>(
@@ -123,7 +126,29 @@ std::shared_ptr<NetworkStack> NetworkStack::create(CephContext *c,
 
 NetworkStack::NetworkStack(CephContext *c)
   : cct(c)
-{}
+{
+  cct->_conf.add_observer(this);
+}
+
+NetworkStack::~NetworkStack()
+{
+  cct->_conf.remove_observer(this);
+  for (auto &&w : workers)
+    delete w;
+}
+
+std::vector<std::string> NetworkStack::get_tracked_keys() const noexcept
+{
+  return {
+    "ms_async_op_threads"s
+  };
+}
+
+void NetworkStack::handle_conf_change(const ConfigProxy& conf,
+                                      const std::set<std::string>& changed)
+{
+  update_num_active_workers();
+}
 
 void NetworkStack::update_num_active_workers()
 {

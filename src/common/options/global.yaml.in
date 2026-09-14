@@ -1425,18 +1425,27 @@ options:
   - startup
   see_also:
   - ms_async_op_threads
-# number of worker processing threads for async messenger created on init
+# how much of that pool is handed out to new connections; adjustable at runtime
 - name: ms_async_op_threads
   type: uint
   level: advanced
-  desc: Threadpool size for AsyncMessenger (ms_type=async)
-  fmt_desc: Initial number of worker threads used by each Async Messenger instance.
+  desc: Number of AsyncMessenger worker threads handed out to new connections (ms_type=async)
+  long_desc: The value may be changed at runtime, including through the monitor
+    configuration database, and takes effect immediately for connections opened
+    from that point on; connections that are already established stay on the
+    worker they were assigned and migrate as they are reopened.  It is clamped to
+    the pool size fixed at startup by ms_async_max_op_threads.
+  fmt_desc: Number of worker threads used by each Async Messenger instance.
     Should be at least equal to highest number of replicas, but you can
     decrease it if you are low on CPU core count and/or you host a lot of
     OSDs on single server.
   default: 3
   min: 1
   max: 24
+  flags:
+  - runtime
+  see_also:
+  - ms_async_max_op_threads
   with_legacy: true
 - name: ms_async_reap_threshold
   type: uint

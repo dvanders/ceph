@@ -18,6 +18,7 @@
 #ifndef CEPH_MSG_ASYNC_STACK_H
 #define CEPH_MSG_ASYNC_STACK_H
 
+#include "common/config_obs.h"
 #include "common/perf_counters.h"
 #include "common/perf_counters_key.h"
 #include "include/spinlock.h"
@@ -34,7 +35,9 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
+#include <vector>
 
 class Worker;
 class ConnectedSocketImpl {
@@ -353,15 +356,15 @@ class Worker {
   }
 };
 
-class NetworkStack {
+class NetworkStack : public md_config_obs_t {
   ceph::spinlock pool_spin;
   bool started = false;
 
   /**
    * Number of workers at the front of `workers` that get_worker() is allowed to
    * hand out.  The pool itself is sized once at startup (see
-   * ms_async_max_op_threads); this is the ms_async_op_threads subset of it.
-   * Zero until the pool has been populated.
+   * ms_async_max_op_threads); this is the ms_async_op_threads subset of it and
+   * may shrink or grow at runtime.  Zero until the pool has been populated.
    */
   std::atomic<unsigned> num_active_workers = {0};
 
@@ -383,13 +386,14 @@ class NetworkStack {
  public:
   NetworkStack(const NetworkStack &) = delete;
   NetworkStack& operator=(const NetworkStack &) = delete;
-  virtual ~NetworkStack() {
-    for (auto &&w : workers)
-      delete w;
-  }
+  ~NetworkStack() override;
 
   static std::shared_ptr<NetworkStack> create(
     CephContext *c, const std::string &type);
+
+  std::vector<std::string> get_tracked_keys() const noexcept override;
+  void handle_conf_change(const ConfigProxy& conf,
+                          const std::set<std::string>& changed) override;
 
   // backend need to override this method if backend doesn't support shared
   // listen table.
