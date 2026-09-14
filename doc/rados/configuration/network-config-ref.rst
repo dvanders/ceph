@@ -335,8 +335,42 @@ Ceph disables TCP buffering by default.
 General Settings
 ----------------
 
+.. _messenger-worker-threads:
+
+Messenger worker threads
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Each daemon creates one pool of Async Messenger worker threads, sized at startup
+by ``ms_async_max_op_threads``.  ``ms_async_op_threads`` selects how many of those
+workers are handed out to new connections and can be changed at runtime, for
+example with::
+
+   ceph config set osd ms_async_op_threads 6
+
+The new value applies immediately to connections opened from that point on.
+Connections that are already established stay on the worker they were assigned,
+so a decrease takes effect gradually, as those connections are reopened.
+
+``ms_async_op_threads`` cannot be raised above ``ms_async_max_op_threads``.  To
+go higher, set ``ms_async_max_op_threads`` in ``ceph.conf`` -- with ``cephadm``,
+by way of ``ceph cephadm set-extra-ceph-conf`` -- and restart the daemons.
+Setting ``ms_async_op_threads`` itself in ``ceph.conf`` also still works, and
+additionally enlarges the pool if it exceeds ``ms_async_max_op_threads``.
+
+Note that ``ms_async_op_threads`` is an ordinary configuration option, so the
+usual precedence applies: a value in ``ceph.conf`` outranks one in the monitor
+configuration database.  A cluster that already worked around the old
+restart-only behaviour by setting ``ms_async_op_threads`` in ``ceph.conf`` will
+not see ``ceph config set`` take effect until that setting is removed.
+
+Workers above the active count sit idle in their event loop.  They are cheap --
+roughly a thread and a quarter of a megabyte of resident memory each, waking no
+more than once every 30 seconds -- but on memory-constrained hosts you may want
+to lower ``ms_async_max_op_threads``, at the cost of less runtime headroom.
+
 .. confval:: ms_type
 .. confval:: ms_async_op_threads
+.. confval:: ms_async_max_op_threads
 .. confval:: ms_initial_backoff
 .. confval:: ms_max_backoff
 .. confval:: ms_die_on_bad_msg
