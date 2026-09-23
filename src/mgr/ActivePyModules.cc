@@ -1635,6 +1635,40 @@ void ActivePyModules::set_device_wear_level(const std::string& devid,
   set_cmd.wait();
 }
 
+void ActivePyModules::set_device_health_status(const std::string& devid,
+					      const std::string& status)
+{
+  // update mgr state
+  std::map<string,string> meta;
+  if (!daemon_state.with_device(
+	devid,
+	[&status, &meta] (DeviceState& dev) {
+	  dev.set_health_status(status, ceph_clock_now());
+	  meta = dev.metadata;
+	})) {
+    // persisting an empty map would erase the stored metadata
+    dout(10) << "device " << devid << " not found" << dendl;
+    return;
+  }
+
+  // tell mon
+  json_spirit::Object json_object;
+  for (auto& i : meta) {
+    json_spirit::Config::add(json_object, i.first, i.second);
+  }
+  bufferlist json;
+  json.append(json_spirit::write(json_object));
+  const string cmd =
+    "{"
+    "\"prefix\": \"config-key set\", "
+    "\"key\": \"device/" + devid + "\""
+    "}";
+
+  Command set_cmd;
+  set_cmd.run(&monc, std::move(cmd), std::move(json));
+  set_cmd.wait();
+}
+
 MetricQueryID ActivePyModules::add_osd_perf_query(
     const OSDPerfMetricQuery &query,
     const std::optional<OSDPerfMetricLimit> &limit)

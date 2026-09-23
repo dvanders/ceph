@@ -798,6 +798,21 @@ ceph_set_wear_level(BaseMgrModule *self, PyObject *args)
 }
 
 static PyObject*
+ceph_set_device_health_status(BaseMgrModule *self, PyObject *args)
+{
+  char *devid = nullptr;
+  char *status = nullptr;
+  if (!PyArg_ParseTuple(args, "ss:ceph_set_device_health_status",
+			&devid, &status)) {
+    return nullptr;
+  }
+  without_gil([&] {
+    self->py_modules->set_device_health_status(devid, status);
+  });
+  Py_RETURN_NONE;
+}
+
+static PyObject*
 ceph_have_mon_connection(BaseMgrModule *self, PyObject *args)
 {
   if (self->py_modules->get_monc().is_connected()) {
@@ -1695,6 +1710,10 @@ PyMethodDef BaseMgrModule_methods[] = {
 
   {"_ceph_set_uri", (PyCFunction)ceph_set_uri, METH_VARARGS,
     "Advertize a service URI served by this module"},
+
+  {"_ceph_set_device_health_status",
+    (PyCFunction)ceph_set_device_health_status, METH_VARARGS,
+   "Set device health verdict"},
 
   {"_ceph_set_device_wear_level", (PyCFunction)ceph_set_wear_level, METH_VARARGS,
    "Set device wear_level value"},

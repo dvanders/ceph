@@ -220,6 +220,23 @@ Each device gets one of four verdicts:
 |             |                                 | value.                        |
 +-------------+---------------------------------+-------------------------------+
 
+``ceph device ls`` shows the verdict in the ``HEALTH`` column and the recorded
+band in ``LIFE EXPECTANCY``:
+
+.. prompt:: bash $
+
+   ceph device ls
+
+::
+
+   DEVICE                    HOST:DEV    DAEMONS  WEAR  HEALTH   LIFE EXPECTANCY
+   WDC_WUH721816ALE6L4_XXXX  ceph01:sdb  osd.3          Bad      <13d
+   TOSHIBA_MG08ACA16TE_YYYY  ceph02:sdf  osd.7          Warning  2w to 6w
+   ST16000NM001G_ZZZZ        ceph03:sdd  osd.11         Good     >6w
+
+``mark_out_threshold`` and ``warn_threshold`` act on ``LIFE EXPECTANCY``,
+which is also where ``ceph device set-life-expectancy`` writes.
+
 The verdicts are risk tiers, not countdowns. On the Backblaze Q1 2026
 drive-stats data (351,095 drives and 1,030 failures over 90 days):
 

@@ -4,6 +4,7 @@
 #include <sstream>
 
 #include "common/Formatter.h"
+#include "common/JSONFormatter.h"
 #include "global/global_init.h"
 #include "gtest/gtest.h"
 #include "include/utime.h"
@@ -30,11 +31,15 @@ TEST_F(DeviceStateTest, SetMetadata)
       {"life_expectancy_min", "1111111111.000000"},
       {"life_expectancy_max", "2222222222.000000"},
       {"life_expectancy_stamp", "1234567890.000000"},
+      {"health_status", "Warning"},
+      {"health_status_stamp", "1234567890.000000"},
       {"wear_level", "0.75"}};
 
   device->set_metadata(std::move(metadata));
 
   ASSERT_EQ(device->wear_level, 0.75f);
+  ASSERT_EQ(device->health_status, "Warning");
+  EXPECT_UTIME_EQ(device->health_status_stamp, utime_t(1234567890, 0));
   utime_t expected_min(1111111111, 0);
   EXPECT_UTIME_EQ(device->life_expectancy.first, expected_min);
   utime_t expected_max(2222222222, 0);
@@ -137,6 +142,51 @@ TEST_F(DeviceStateTest, GetLifeExpectancyStr)
   result = device->get_life_expectancy_str(now);
 
   ASSERT_EQ(result, "8m");
+}
+
+TEST_F(DeviceStateTest, SetHealthStatus)
+{
+  utime_t now(900, 0);
+
+  device->set_health_status("Bad", now);
+
+  ASSERT_EQ(device->health_status, "Bad");
+  ASSERT_EQ(device->health_status_stamp, now);
+  ASSERT_EQ(device->metadata["health_status"], "Bad");
+  ASSERT_EQ(device->metadata["health_status_stamp"], "900.000000");
+}
+
+TEST_F(DeviceStateTest, ClearHealthStatus)
+{
+  // an empty status removes the metadata keys
+  device->set_health_status("Bad", utime_t(900, 0));
+  device->set_health_status("", utime_t(1000, 0));
+
+  ASSERT_EQ(device->health_status, "");
+  ASSERT_EQ(device->health_status_stamp, utime_t());
+  ASSERT_EQ(device->metadata.count("health_status"), 0u);
+  ASSERT_EQ(device->metadata.count("health_status_stamp"), 0u);
+}
+
+static std::string dump_json(const DeviceState& dev)
+{
+  ceph::JSONFormatter f;
+  f.dump_object("device", dev);
+  std::ostringstream oss;
+  f.flush(oss);
+  return oss.str();
+}
+
+TEST_F(DeviceStateTest, HealthStatusIsDumpedOnlyWhenSet)
+{
+  ASSERT_EQ(dump_json(*device).find("health_status"), std::string::npos);
+
+  device->set_health_status("Warning", utime_t(900, 0));
+  ASSERT_NE(dump_json(*device).find("health_status"), std::string::npos);
+  ASSERT_NE(dump_json(*device).find("Warning"), std::string::npos);
+
+  device->set_health_status("", utime_t(1000, 0));
+  ASSERT_EQ(dump_json(*device).find("health_status"), std::string::npos);
 }
 
 /* Begin Negative Tests */

@@ -103,6 +103,9 @@ struct DeviceState : public RefCountedObject
   std::pair<utime_t,utime_t> life_expectancy;  ///< when device failure is expected
   utime_t life_expectancy_stamp;          ///< when life expectency was recorded
   float wear_level = -1;                  ///< SSD wear level (negative if unknown)
+  /// a predictor's verdict (e.g. Good, Warning, Bad), empty if none
+  std::string health_status;
+  utime_t health_status_stamp;             ///< when the verdict was recorded
 
   void set_metadata(std::map<std::string,std::string>&& m);
 
@@ -110,6 +113,9 @@ struct DeviceState : public RefCountedObject
   void rm_life_expectancy();
 
   void set_wear_level(float wear);
+
+  /// record a verdict, or clear it when 'status' is empty
+  void set_health_status(const std::string& status, utime_t now);
 
   std::string get_life_expectancy_str(utime_t now) const;
 

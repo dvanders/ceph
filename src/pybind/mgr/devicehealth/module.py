@@ -1093,9 +1093,21 @@ class Module(MgrModule):
             return False
         return expires > datetime.now(timezone.utc)
 
+    def _record_health_status(self, dev: Dict[str, Any], status: str) -> None:
+        """Publish the verdict for 'ceph device ls'.
+
+        Unknown clears it.  Only changes are written, since each write is a
+        mon config-key update.
+        """
+        wanted = status if status in LIFE_EXPECTANCY else ''
+        if dev.get('health_status', '') == wanted:
+            return
+        self.set_device_health_status(dev['devid'], wanted)
+
     def _apply_prediction(self, dev: Dict[str, Any], status: str) -> None:
-        """Translate a verdict into a life expectancy on the device."""
+        """Record a verdict and its life expectancy on the device."""
         devid = dev['devid']
+        self._record_health_status(dev, status)
         if status not in LIFE_EXPECTANCY:
             # Unknown: retract any earlier expectancy
             if dev.get('life_expectancy_min') or dev.get('life_expectancy_max'):

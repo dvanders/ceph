@@ -2602,6 +2602,15 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
     def set_device_wear_level(self, devid: str, wear_level: float) -> None:
         return self._ceph_set_device_wear_level(devid, wear_level)
 
+    @API.perm('w')
+    @API.expose
+    def set_device_health_status(self, devid: str, status: str) -> None:
+        """Record a predictor's verdict on a device, for 'ceph device ls'.
+
+        An empty status clears any verdict already recorded.
+        """
+        return self._ceph_set_device_health_status(devid, status)
+
     @API.expose
     def have_mon_connection(self) -> bool:
         """

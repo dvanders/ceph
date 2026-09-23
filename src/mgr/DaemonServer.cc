@@ -2904,6 +2904,7 @@ bool DaemonServer::_handle_command(
       tbl.define_column("HOST:DEV", TextTable::LEFT, TextTable::LEFT);
       tbl.define_column("DAEMONS", TextTable::LEFT, TextTable::LEFT);
       tbl.define_column("WEAR", TextTable::RIGHT, TextTable::RIGHT);
+      tbl.define_column("HEALTH", TextTable::LEFT, TextTable::LEFT);
       tbl.define_column("LIFE EXPECTANCY", TextTable::LEFT, TextTable::LEFT);
       auto now = ceph_clock_now();
       daemon_state.with_devices([&tbl, now](const DeviceState& dev) {
@@ -2930,6 +2931,7 @@ bool DaemonServer::_handle_command(
 	      << h
 	      << d
 	      << wear_level_str
+	      << dev.health_status
 	      << dev.get_life_expectancy_str(now)
 	      << TextTable::endrow;
 	});
@@ -2959,6 +2961,7 @@ bool DaemonServer::_handle_command(
 	  TextTable tbl;
 	  tbl.define_column("DEVICE", TextTable::LEFT, TextTable::LEFT);
 	  tbl.define_column("HOST:DEV", TextTable::LEFT, TextTable::LEFT);
+	  tbl.define_column("HEALTH", TextTable::LEFT, TextTable::LEFT);
 	  tbl.define_column("EXPECTED FAILURE", TextTable::LEFT,
 			    TextTable::LEFT);
 	  auto now = ceph_clock_now();
@@ -2974,6 +2977,7 @@ bool DaemonServer::_handle_command(
 		}
 		tbl << dev.devid
 		    << h
+		    << dev.health_status
 		    << dev.get_life_expectancy_str(now)
 		    << TextTable::endrow;
 	      });
@@ -3006,6 +3010,7 @@ bool DaemonServer::_handle_command(
       tbl.define_column("DEVICE", TextTable::LEFT, TextTable::LEFT);
       tbl.define_column("DEV", TextTable::LEFT, TextTable::LEFT);
       tbl.define_column("DAEMONS", TextTable::LEFT, TextTable::LEFT);
+      tbl.define_column("HEALTH", TextTable::LEFT, TextTable::LEFT);
       tbl.define_column("EXPECTED FAILURE", TextTable::LEFT, TextTable::LEFT);
       auto now = ceph_clock_now();
       for (auto& devid : devids) {
@@ -3030,6 +3035,7 @@ bool DaemonServer::_handle_command(
 	    tbl << dev.devid
 		<< n
 		<< d
+		<< dev.health_status
 		<< dev.get_life_expectancy_str(now)
 		<< TextTable::endrow;
 	  });

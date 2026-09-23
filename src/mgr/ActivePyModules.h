@@ -200,6 +200,8 @@ public:
 
   void set_uri(const std::string& module_name, const std::string &uri);
   void set_device_wear_level(const std::string& devid, float wear_level);
+  void set_device_health_status(const std::string& devid,
+			       const std::string& status);
 
   int handle_command(
     const ModuleCommand& module_command,

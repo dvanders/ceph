@@ -65,6 +65,12 @@
   ``ceph device get-predictor-ruleset`` shows the rules in effect and
   ``ceph device rm-predictor-ruleset`` restores the built-in ones.
 
+* MGR: ``ceph device ls``, ``ls-by-host`` and ``ls-by-daemon`` have a new
+  ``HEALTH`` column showing the failure predictor's verdict (``Good``,
+  ``Warning`` or ``Bad``). ``ceph device info`` and JSON output include it as
+  ``health_status`` and ``health_status_stamp``. The ``devicehealth`` SMART
+  predictor sets it.
+
 * MGR: The ``cloud`` value of ``device_failure_prediction_mode`` has been
   removed; the ``diskprediction_cloud`` module it selected no longer exists.
   Clusters with it set should switch to ``local`` or ``none``.

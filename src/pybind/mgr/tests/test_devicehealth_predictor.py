@@ -592,6 +592,7 @@ class TestPredictAllDevices:
         module.get_recent_device_metrics = mock.Mock(return_value=metrics)
         module._set_device_life_expectancy = mock.Mock(return_value=0)
         module._reset_device_life_expectancy = mock.Mock(return_value=0)
+        module.set_device_health_status = mock.Mock(return_value=None)
         return module
 
     def days(self, module: Any) -> Any:
@@ -648,6 +649,22 @@ class TestPredictAllDevices:
         module.predict_all_devices()
         module._set_device_life_expectancy.assert_not_called()
         module._reset_device_life_expectancy.assert_not_called()
+
+    def test_the_verdict_itself_reaches_the_device(self) -> None:
+        module = self.build([ata(a197=(8, 100, 0))])
+        module.predict_all_devices()
+        module.set_device_health_status.assert_called_once_with('D1',
+                                                               'Warning')
+
+    def test_a_good_device_left_alone_still_reports_its_verdict(self) -> None:
+        from datetime import datetime, timedelta, timezone
+        future = (datetime.now(timezone.utc) + timedelta(days=30)) \
+            .strftime('%Y-%m-%dT%H:%M:%S.%f%z')
+        module = self.build([ata(a5=(0, 200, 140))],
+                            life_expectancy_min=future)
+        module.predict_all_devices()
+        module._set_device_life_expectancy.assert_not_called()
+        module.set_device_health_status.assert_called_once_with('D1', 'Good')
 
     def test_unknown_device_retracts_a_stale_record(self) -> None:
         module = self.build([{}], life_expectancy_min='2020-01-01T00:00:00.000000+0000')

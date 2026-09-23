@@ -64,6 +64,14 @@ void DeviceState::set_metadata(map<string,string>&& m)
   if (p != metadata.end()) {
     wear_level = atof(p->second.c_str());
   }
+  p = metadata.find("health_status");
+  if (p != metadata.end()) {
+    health_status = p->second;
+  }
+  p = metadata.find("health_status_stamp");
+  if (p != metadata.end()) {
+    health_status_stamp.parse(p->second);
+  }
 }
 
 void DeviceState::set_life_expectancy(utime_t from, utime_t to, utime_t now)
@@ -94,6 +102,20 @@ void DeviceState::rm_life_expectancy()
   metadata.erase("life_expectancy_min");
   metadata.erase("life_expectancy_max");
   metadata.erase("life_expectancy_stamp");
+}
+
+void DeviceState::set_health_status(const string& status, utime_t now)
+{
+  health_status = status;
+  if (status.empty()) {
+    health_status_stamp = utime_t();
+    metadata.erase("health_status");
+    metadata.erase("health_status_stamp");
+    return;
+  }
+  health_status_stamp = now;
+  metadata["health_status"] = status;
+  metadata["health_status_stamp"] = stringify(now);
 }
 
 void DeviceState::set_wear_level(float wear)
@@ -163,6 +185,10 @@ void DeviceState::dump(Formatter *f) const
   if (wear_level >= 0) {
     f->dump_float("wear_level", wear_level);
   }
+  if (!health_status.empty()) {
+    f->dump_string("health_status", health_status);
+    f->dump_stream("health_status_stamp") << health_status_stamp;
+  }
 }
 
 void DeviceState::print(ostream& out) const
@@ -180,6 +206,10 @@ void DeviceState::print(ostream& out) const
     out << "life_expectancy " << life_expectancy.first << " to "
 	<< life_expectancy.second
 	<< " (as of " << life_expectancy_stamp << ")\n";
+  }
+  if (!health_status.empty()) {
+    out << "health_status " << health_status
+	<< " (as of " << health_status_stamp << ")\n";
   }
   if (wear_level >= 0) {
     out << "wear_level " << wear_level << "\n";
