@@ -339,56 +339,129 @@ Rulesets
 --------
 
 The built-in rules use only counters that mean the same thing across drive
-models. To add rules for a particular model, or to flag a known-bad firmware,
-use a ruleset.
+models. To add rules for a particular model, turn off a rule that misfires on
+one, or flag a known-bad firmware, use a ruleset: a JSON document of changes
+to the built-in rules.
 
-To see which verdicts a ruleset would change, without loading it, run a
-command of the following form. Add a device id to see that device's full
-explanation under the new rules:
+Writing a ruleset
+~~~~~~~~~~~~~~~~~
+
+This example adds a rule for a made-up drive model, ``EXAMPLE HDD-8``, whose
+vendor documents that SMART attribute 200 counts write errors. The commands
+below use ``jq`` to read the JSON output.
+
+#. Find the device id:
+
+   .. prompt:: bash #
+
+      ceph device ls
+
+#. Save the newest SMART sample for the device. ``ceph device
+   get-health-metrics`` prints every stored sample, keyed by time, so take the
+   last one:
+
+   .. prompt:: bash #
+
+      ceph device get-health-metrics <devid> | jq 'to_entries | last | .value' > sample.json
+
+   Show the fields that a profile can match on:
+
+   .. prompt:: bash $
+
+      jq '{model_name, model_family, firmware_version, vendor, product}' sample.json
+
+   ::
+
+      {
+        "model_name": "EXAMPLE HDD-8",
+        "model_family": null,
+        "firmware_version": "XF01",
+        "vendor": null,
+        "product": null
+      }
+
+   Show the SMART attributes, with the ids that ``ata`` rules use:
+
+   .. prompt:: bash $
+
+      jq -c '.ata_smart_attributes.table[] | {id, name, value, thresh, raw: .raw.value}' sample.json
+
+   ::
+
+      {"id":5,"name":"Reallocated_Sector_Ct","value":100,"thresh":10,"raw":0}
+      {"id":200,"name":"Write_Error_Count","value":100,"thresh":0,"raw":28}
+      ...
+
+   Show the device statistics, with the page and offset that
+   ``device_statistics`` rules use:
+
+   .. prompt:: bash $
+
+      jq -c '.ata_device_statistics.pages[] | .number as $p | .table[]? | {page: $p, offset, name, value}' sample.json
+
+#. Write a ruleset that contains only your changes:
+
+   .. code-block:: json
+
+      {
+        "ruleset": "site-2026.09",
+        "profiles": [
+          {
+            "name": "example-hdd-8",
+            "match": {"model_name": "EXAMPLE HDD-8*"},
+            "ata": {"200": {"name": "Write_Error_Count", "growth": 10}}
+          }
+        ]
+      }
+
+   The built-in rules are always included, so do not start from the output
+   of ``ceph device get-predictor-ruleset``. A rule copied from it replaces
+   the built-in rule of the same id, and later Ceph releases can then no
+   longer improve that rule for you.
+
+   Give each version of the file a new ``ruleset`` name, such as a date, and
+   keep it in version control. ``ceph device explain-health`` reports the
+   name, so you can tell which version produced a verdict.
+
+#. See which verdicts the ruleset would change, without loading it. Add a
+   device id to see that device's full explanation under the new rules:
+
+   .. prompt:: bash #
+
+      ceph device test-predictor-ruleset -i ruleset.json
+      ceph device test-predictor-ruleset <devid> -i ruleset.json
+
+   ::
+
+      compared ruleset site-2026.09 with builtin
+      1 of 412 verdict(s) would change:
+        EXAMPLE_HDD-8_XXXXXXXX: Good -> Warning
+
+#. Load the ruleset:
+
+   .. prompt:: bash #
+
+      ceph device set-predictor-ruleset -i ruleset.json
+
+   When the prediction mode is ``smart``, this re-judges every device
+   immediately and lists the verdicts that changed. Check a device with
+   ``ceph device explain-health``:
+
+   ::
+
+      EXAMPLE_HDD-8_XXXXXXXX: Warning
+        - Write_Error_Count (ATA 200) grew by 12 over the sample window, to 40
+      ruleset: site-2026.09 (profile: example-hdd-8)
+
+To show the rules in effect, or to return to the built-in rules:
 
 .. prompt:: bash #
 
-   ceph device test-predictor-ruleset -i ruleset.json
-   ceph device test-predictor-ruleset <devid> -i ruleset.json
-
-::
-
-   compared ruleset example-2026.08 with builtin
-   1 of 412 verdict(s) would change:
-     EXAMPLE_MODEL-1_XXXXXXXX: Warning -> Good
-
-To load a ruleset, show the rules in effect, or return to the built-in rules:
-
-.. prompt:: bash #
-
-   ceph device set-predictor-ruleset -i ruleset.json
    ceph device get-predictor-ruleset
    ceph device rm-predictor-ruleset
 
-When the prediction mode is ``smart``, loading or removing a ruleset
-re-judges every device immediately and lists the verdicts that changed.
-
-A ruleset is a JSON document that starts from the built-in rules. For
-example:
-
-.. code-block:: json
-
-   {
-     "ruleset": "example-2026.08",
-     "defaults": {"counter_backstop": 256},
-     "profiles": [
-       {
-         "name": "toshiba-mg07",
-         "match": {"model_name": "TOSHIBA MG07ACA*"},
-         "defaults": {"normalized_headroom_fraction": 0.25},
-         "ata": {"1": {"name": "Raw_Read_Error_Rate", "growth": 1}},
-         "device_statistics": [
-           {"name": "Spindle Speed Deviations",
-            "page": 3, "offset": 64, "growth": 1}
-         ]
-       }
-     ]
-   }
+Ruleset reference
+~~~~~~~~~~~~~~~~~
 
 Top-level keys (only ``ruleset`` is required):
 
@@ -438,11 +511,11 @@ For example, to stop judging ``Current_Pending_Sector`` on one model:
 .. code-block:: json
 
    {
-     "ruleset": "example-2026.08",
+     "ruleset": "site-2026.09",
      "profiles": [
        {
          "name": "quiet-pending",
-         "match": {"model_name": "EXAMPLE MODEL-1*"},
+         "match": {"model_name": "EXAMPLE HDD-9*"},
          "ata": {"197": {"disabled": true}}
        }
      ]
@@ -489,14 +562,14 @@ A profile can also assert a verdict from the device's identity alone:
 .. code-block:: json
 
    {
-     "ruleset": "example-2026.08",
+     "ruleset": "site-2026.09",
      "profiles": [
        {
-         "name": "st4000nm-sc61",
-         "match": {"model_name": "ST4000NM*", "firmware_version": "SC61"},
+         "name": "example-ssd-4-xf01",
+         "match": {"model_name": "EXAMPLE SSD-4*", "firmware_version": "XF01"},
          "findings": [
            {"status": "Bad",
-            "reason": "SC61 can lose writes on power loss; use SC62"}
+            "reason": "XF01 can lose writes on power loss; upgrade to XF02"}
          ]
        }
      ]
@@ -506,12 +579,14 @@ These findings apply even when the device returns no usable SMART data. Only
 ``Warning`` and ``Bad`` can be asserted, and findings are allowed only in
 profiles.
 
-``ceph device explain-health`` reports the ruleset and profiles behind a
-verdict::
+``ceph device explain-health`` reports the ruleset, profiles and disabled
+rules behind a verdict. For a device matched by the ``quiet-pending`` profile
+above::
 
-   Toshiba_MG07ACA14TE_XXXXXXXX: Warning
-     - Spindle Speed Deviations (device statistics page 3) grew by 3 ...
-   ruleset: example-2026.08 (profile: toshiba-mg07)
+   EXAMPLE_HDD-9_XXXXXXXX: Good
+     - no rule matched
+   ruleset: site-2026.09 (profile: quiet-pending)
+   disabled: Current_Pending_Sector (ATA 197) by profile quiet-pending
 
 A ruleset is validated when it is loaded. Unknown keys, thresholds below 1,
 and tunables outside their ranges are rejected. If a stored ruleset
