@@ -274,7 +274,8 @@ against a fresh value of 100.
 
 Attributes whose meaning varies by vendor, such as ``Raw_Read_Error_Rate`` or
 temperature, are ignored, as is power-on time. A rule does not apply to a
-drive that does not report its attribute.
+drive that does not report its attribute. Rules for a specific model can be
+added with a ruleset (see below).
 
 When a drive reports the ACS Device Statistics log, these statistics are used
 in place of the matching attributes:
@@ -316,6 +317,148 @@ To see why a device got its verdict, run a command of the following form:
    WDC_WUH721816ALE6L4_XXXXXXXX: Warning
      - Current_Pending_Sector (ATA 197) is 8, at or above the threshold of 1
      - Reallocated_Sector_Ct (ATA 5) grew by 4 over the sample window, to 12
+
+Rulesets
+--------
+
+The built-in rules use only counters that mean the same thing across drive
+models. To add rules for a particular model, or to flag a known-bad firmware,
+load a ruleset:
+
+.. prompt:: bash #
+
+   ceph device set-predictor-ruleset -i ruleset.json
+   ceph device get-predictor-ruleset
+   ceph device rm-predictor-ruleset
+
+A ruleset is a JSON document that starts from the built-in rules. For
+example:
+
+.. code-block:: json
+
+   {
+     "ruleset": "example-2026.08",
+     "defaults": {"counter_backstop": 256},
+     "profiles": [
+       {
+         "name": "toshiba-mg07",
+         "match": {"model_name": "TOSHIBA MG07ACA*"},
+         "defaults": {"normalized_headroom_fraction": 0.25},
+         "ata": {"1": {"name": "Raw_Read_Error_Rate", "growth": 1}},
+         "device_statistics": [
+           {"name": "Spindle Speed Deviations",
+            "page": 3, "offset": 64, "growth": 1}
+         ]
+       }
+     ]
+   }
+
+Top-level keys (only ``ruleset`` is required):
+
+``ruleset``
+   A name, reported by ``ceph device explain-health``.
+``defaults``
+   Tunables to change, from the table below.
+``ata``
+   SMART attribute rules, keyed by attribute id as a string.
+``device_statistics``
+   ACS Device Statistics rules, as an array.
+``profiles``
+   Rules for matching devices only. Each has a ``name``, a ``match``, and any
+   of ``defaults``, ``ata``, ``device_statistics`` and ``findings``.
+
+An ``ata`` or ``device_statistics`` rule is added to the built-in rules, or
+replaces the built-in rule with the same attribute id, or the same page and
+offset. A rule has these keys:
+
+``name``
+   Required. The name used in verdicts.
+``growth``
+   Warn when the counter grows by at least this much within the prediction
+   window. At least 1. Most counters want this.
+``absolute``
+   Warn when the counter's current value is at least this much. Use this only
+   for gauges such as ``Current_Pending_Sector``.
+``page``, ``offset``
+   Required for ``device_statistics``: the location of the statistic.
+``supersedes``
+   Only for ``device_statistics``: the SMART attribute id whose raw counter
+   this statistic replaces.
+
+A rule with neither ``absolute`` nor ``growth`` treats the raw value as a
+level rather than a count. Only its vendor-threshold margin is checked, and
+``counter_backstop`` does not apply. The helium rules are defined this way.
+
+``defaults`` may set these tunables, in a ruleset or a profile:
+
++----------------------------------+---------+---------------------------------+
+| Key                              | Default | Meaning                         |
++==================================+=========+=================================+
+| ``counter_backstop``             | 256     | Warn on any defect counter at   |
+|                                  |         | or above this value.            |
++----------------------------------+---------+---------------------------------+
+| ``normalized_headroom_fraction`` | 0.1     | Warn when the margin to the     |
+|                                  |         | vendor threshold is at most     |
+|                                  |         | this fraction of the range.     |
++----------------------------------+---------+---------------------------------+
+| ``wear_warning``                 | 0.9     | Warn at this fraction of rated  |
+|                                  |         | write endurance.                |
++----------------------------------+---------+---------------------------------+
+| ``nvme_spare_headroom``          | 10      | Warn when NVMe available spare  |
+|                                  |         | is within this many points of   |
+|                                  |         | its threshold.                  |
++----------------------------------+---------+---------------------------------+
+| ``nvme_used_warning``            | 90      | Warn at this NVMe               |
+|                                  |         | ``percentage_used``.            |
++----------------------------------+---------+---------------------------------+
+| ``scsi_defect_growth``           | 1       | SAS grown defect list growth    |
+|                                  |         | that warns.                     |
++----------------------------------+---------+---------------------------------+
+| ``scsi_error_growth``            | 1       | SAS uncorrected error growth    |
+|                                  |         | that warns.                     |
++----------------------------------+---------+---------------------------------+
+
+A profile's ``match`` may name ``model_name``, ``model_family``,
+``firmware_version``, ``vendor`` and ``product``. Each is a case-insensitive
+shell-style pattern. Every named field must match, and a field the device does
+not report never matches. Profiles are applied in order, and later ones win.
+
+A profile can also assert a verdict from the device's identity alone:
+
+.. code-block:: json
+
+   {
+     "ruleset": "example-2026.08",
+     "profiles": [
+       {
+         "name": "st4000nm-sc61",
+         "match": {"model_name": "ST4000NM*", "firmware_version": "SC61"},
+         "findings": [
+           {"status": "Bad",
+            "reason": "SC61 can lose writes on power loss; use SC62"}
+         ]
+       }
+     ]
+   }
+
+These findings apply even when the device returns no usable SMART data. Only
+``Warning`` and ``Bad`` can be asserted, so a ruleset cannot hide a failure.
+Findings are allowed only in profiles.
+
+``ceph device explain-health`` reports the ruleset and profiles behind a
+verdict::
+
+   Toshiba_MG07ACA14TE_XXXXXXXX: Warning
+     - Spindle Speed Deviations (device statistics page 3) grew by 3 ...
+   ruleset: example-2026.08 (profile: toshiba-mg07)
+
+A ruleset is validated when it is loaded. Unknown keys and values that would
+flag every device, such as a growth of 0, are rejected. If a stored ruleset
+later fails to load, for example after a downgrade, the module logs an error
+and uses the built-in rules.
+
+.. note:: A ruleset changes which OSDs ``self_heal`` marks ``out``. The rate
+   limits under `Automatic Migration`_ still apply.
 
 Health alerts
 -------------

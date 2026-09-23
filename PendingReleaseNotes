@@ -58,6 +58,13 @@
   shows why a device was flagged. ``mgr/devicehealth/prediction_window``
   (default 30 days) sets how far back it looks for counter growth.
 
+* MGR: The ``devicehealth`` SMART predictor's rules can be extended with a
+  JSON ruleset: ``ceph device set-predictor-ruleset -i <file>``. A ruleset can
+  change thresholds, add or replace rules, and define per-model profiles,
+  including verdicts for known-bad models or firmware.
+  ``ceph device get-predictor-ruleset`` shows the rules in effect and
+  ``ceph device rm-predictor-ruleset`` restores the built-in ones.
+
 * MGR: The ``cloud`` value of ``device_failure_prediction_mode`` has been
   removed; the ``diskprediction_cloud`` module it selected no longer exists.
   Clusters with it set should switch to ``local`` or ``none``.

@@ -10,6 +10,7 @@ newest and oldest samples in the window.  Defect counters use growth, so a
 drive with a few long-settled reallocated sectors is not flagged.
 """
 
+import fnmatch
 from typing import (Any, Dict, List, Mapping, NamedTuple, Optional, Sequence,
                     Set, Tuple, TypeVar)
 
@@ -112,10 +113,104 @@ SCSI_ERROR_GROWTH = 1    # uncorrected errors added over the window
 COUNTER_BACKSTOP = 256
 
 
+class Rules(NamedTuple):
+    """The rules in effect for one device, after profiles are resolved."""
+    ata: Mapping[int, AtaRule]
+    device_statistics: Tuple[DevStat, ...]
+    # (status, reason) asserted from the device's identity alone
+    findings: Tuple[Tuple[str, str], ...]
+    counter_backstop: int
+    normalized_headroom_fraction: float
+    wear_warning: float
+    nvme_spare_headroom: int
+    nvme_used_warning: int
+    scsi_defect_growth: int
+    scsi_error_growth: int
+
+
+# The tunable scalars, by the name a ruleset document uses for each.
+SCALARS: Tuple[str, ...] = (
+    'counter_backstop', 'normalized_headroom_fraction', 'wear_warning',
+    'nvme_spare_headroom', 'nvme_used_warning', 'scsi_defect_growth',
+    'scsi_error_growth',
+)
+
+BUILTIN_RULES = Rules(
+    ata=ATA_RULES,
+    device_statistics=DEVICE_STATISTICS,
+    findings=(),
+    counter_backstop=COUNTER_BACKSTOP,
+    normalized_headroom_fraction=NORMALIZED_HEADROOM_FRACTION,
+    wear_warning=WEAR_WARNING,
+    nvme_spare_headroom=NVME_SPARE_HEADROOM,
+    nvme_used_warning=NVME_USED_WARNING,
+    scsi_defect_growth=SCSI_DEFECT_GROWTH,
+    scsi_error_growth=SCSI_ERROR_GROWTH,
+)
+
+# smartctl fields a profile may match on: identity only, never state
+MATCH_FIELDS: Tuple[str, ...] = (
+    'model_name', 'model_family', 'firmware_version', 'vendor', 'product',
+)
+
+
+class Profile(NamedTuple):
+    """Rule overrides that apply only to the devices a pattern matches."""
+    name: str
+    match: Mapping[str, str]
+    ata: Mapping[int, AtaRule]
+    device_statistics: Tuple[DevStat, ...]
+    findings: Tuple[Tuple[str, str], ...]
+    scalars: Mapping[str, Any]
+
+    def matches(self, data: Dict[str, Any]) -> bool:
+        # every named field must match; a missing field never matches
+        for field, pattern in self.match.items():
+            value = data.get(field)
+            if not isinstance(value, str):
+                return False
+            if not fnmatch.fnmatch(value.lower(), pattern.lower()):
+                return False
+        return True
+
+
+class Ruleset(NamedTuple):
+    """A base set of rules plus any per-model overrides."""
+    name: str
+    base: Rules
+    profiles: Tuple[Profile, ...]
+
+    def resolve(self, data: Dict[str, Any]) -> Tuple[Rules, List[str]]:
+        """The rules for this device, and the profiles that shaped them."""
+        rules = self.base
+        applied: List[str] = []
+        for profile in self.profiles:
+            if not profile.matches(data):
+                continue
+            applied.append(profile.name)
+            ata = dict(rules.ata)
+            ata.update(profile.ata)
+            stats = {(d.page, d.offset): d for d in rules.device_statistics}
+            for stat in profile.device_statistics:
+                stats[(stat.page, stat.offset)] = stat
+            rules = rules._replace(
+                ata=ata,
+                device_statistics=tuple(stats[k] for k in sorted(stats)),
+                findings=rules.findings + profile.findings,
+                **profile.scalars)
+        return rules, applied
+
+
+BUILTIN_RULESET = Ruleset(name='builtin', base=BUILTIN_RULES, profiles=())
+
+
 class Prediction(NamedTuple):
     """A verdict plus the human-readable reasons that produced it."""
     status: str
     reasons: List[str]
+    # the ruleset and profiles that produced it
+    ruleset: str = 'builtin'
+    profiles: Tuple[str, ...] = ()
 
 
 class Sample(NamedTuple):
@@ -134,6 +229,227 @@ class Sample(NamedTuple):
     def has_data(self) -> bool:
         return bool(self.passed is not None or self.ata_raw or self.nvme
                     or self.scsi or self.dev_stats or self.wear is not None)
+
+
+class RulesetError(ValueError):
+    """A ruleset document was rejected."""
+
+
+# (type, min, max) per scalar.  A typo such as a backstop of 0 would
+# otherwise flag every device.
+_SCALAR_LIMITS: Dict[str, Tuple[type, Any, Any]] = {
+    'counter_backstop': (int, 1, None),
+    'normalized_headroom_fraction': (float, 0.0, 1.0),
+    'wear_warning': (float, 0.0, 1.0),
+    'nvme_spare_headroom': (int, 0, 100),
+    'nvme_used_warning': (int, 1, 255),
+    'scsi_defect_growth': (int, 1, None),
+    'scsi_error_growth': (int, 1, None),
+}
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise RulesetError(message)
+
+
+def _known_keys(where: str, doc: Any, allowed: Sequence[str]) -> None:
+    _require(isinstance(doc, dict), '%s must be an object' % where)
+    unknown = sorted(set(doc) - set(allowed))
+    _require(not unknown, '%s has unknown key(s): %s'
+             % (where, ', '.join(unknown)))
+
+
+def _load_scalars(where: str, doc: Any) -> Dict[str, Any]:
+    if doc is None:
+        return {}
+    _known_keys(where, doc, SCALARS)
+    out: Dict[str, Any] = {}
+    for key, value in doc.items():
+        want, low, high = _SCALAR_LIMITS[key]
+        if want is float:
+            _require(isinstance(value, (int, float))
+                     and not isinstance(value, bool),
+                     '%s/%s must be a number' % (where, key))
+            value = float(value)
+        else:
+            _require(isinstance(value, int) and not isinstance(value, bool),
+                     '%s/%s must be an integer' % (where, key))
+        _require(low is None or value >= low,
+                 '%s/%s must be at least %s' % (where, key, low))
+        _require(high is None or value <= high,
+                 '%s/%s must be at most %s' % (where, key, high))
+        out[key] = value
+    return out
+
+
+def _load_counter(where: str, doc: Any) -> Tuple[Optional[int], Optional[int]]:
+    absolute = doc.get('absolute')
+    growth = doc.get('growth')
+    for label, value in (('absolute', absolute), ('growth', growth)):
+        if value is None:
+            continue
+        _require(isinstance(value, int) and not isinstance(value, bool),
+                 '%s/%s must be an integer or null' % (where, label))
+        _require(value >= 1, '%s/%s must be at least 1' % (where, label))
+    return absolute, growth
+
+
+def _load_ata(where: str, doc: Any) -> Dict[int, AtaRule]:
+    if doc is None:
+        return {}
+    _require(isinstance(doc, dict), '%s must be an object' % where)
+    out: Dict[int, AtaRule] = {}
+    for key, entry in doc.items():
+        try:
+            aid = int(key)
+        except (TypeError, ValueError):
+            raise RulesetError('%s has a non-numeric attribute id: %r'
+                               % (where, key))
+        _require(0 <= aid <= 255,
+                 '%s/%s is not a SMART attribute id' % (where, key))
+        at = '%s/%s' % (where, key)
+        _known_keys(at, entry, ('name', 'absolute', 'growth'))
+        name = entry.get('name')
+        _require(isinstance(name, str) and name != '',
+                 '%s/name must be a non-empty string' % at)
+        absolute, growth = _load_counter(at, entry)
+        out[aid] = AtaRule(name, absolute, growth)
+    return out
+
+
+def _load_device_statistics(where: str, doc: Any) -> Tuple[DevStat, ...]:
+    if doc is None:
+        return ()
+    _require(isinstance(doc, list), '%s must be an array' % where)
+    out = []
+    for i, entry in enumerate(doc):
+        at = '%s[%d]' % (where, i)
+        _known_keys(at, entry, ('name', 'page', 'offset', 'absolute',
+                                'growth', 'supersedes'))
+        name = entry.get('name')
+        _require(isinstance(name, str) and name != '',
+                 '%s/name must be a non-empty string' % at)
+        for field in ('page', 'offset'):
+            value = entry.get(field)
+            _require(isinstance(value, int) and not isinstance(value, bool)
+                     and value >= 0,
+                     '%s/%s must be a non-negative integer' % (at, field))
+        supersedes = entry.get('supersedes')
+        _require(supersedes is None
+                 or (isinstance(supersedes, int)
+                     and not isinstance(supersedes, bool)
+                     and 0 <= supersedes <= 255),
+                 '%s/supersedes must be a SMART attribute id or null' % at)
+        absolute, growth = _load_counter(at, entry)
+        out.append(DevStat(name, entry['page'], entry['offset'],
+                           absolute, growth, supersedes))
+    return tuple(out)
+
+
+def _load_findings(where: str, doc: Any) -> Tuple[Tuple[str, str], ...]:
+    """Verdicts a profile asserts from the device's identity alone.
+
+    Only Warning and Bad are allowed, so a ruleset cannot hide a failure.
+    """
+    if doc is None:
+        return ()
+    _require(isinstance(doc, list), '%s must be an array' % where)
+    out = []
+    for i, entry in enumerate(doc):
+        at = '%s[%d]' % (where, i)
+        _known_keys(at, entry, ('status', 'reason'))
+        status = entry.get('status')
+        _require(status in (WARNING, BAD),
+                 '%s/status must be "%s" or "%s"' % (at, WARNING, BAD))
+        reason = entry.get('reason')
+        _require(isinstance(reason, str) and reason != '',
+                 '%s/reason must be a non-empty string saying why' % at)
+        out.append((status, reason))
+    return tuple(out)
+
+
+def load_ruleset(doc: Any) -> Ruleset:
+    """Build a :class:`Ruleset` from a parsed ruleset document.
+
+    Raises :class:`RulesetError` if the document is invalid.
+    """
+    # 'findings' are only allowed in a profile, or they would match every
+    # device
+    _known_keys('ruleset document', doc,
+                ('ruleset', 'defaults', 'ata', 'device_statistics',
+                 'profiles'))
+    name = doc.get('ruleset')
+    _require(isinstance(name, str) and name != '',
+             'ruleset must be a non-empty string naming this ruleset')
+
+    ata = dict(BUILTIN_RULES.ata)
+    ata.update(_load_ata('ata', doc.get('ata')))
+    stats = {(d.page, d.offset): d for d in BUILTIN_RULES.device_statistics}
+    for stat in _load_device_statistics('device_statistics',
+                                        doc.get('device_statistics')):
+        stats[(stat.page, stat.offset)] = stat
+    base = BUILTIN_RULES._replace(
+        ata=ata,
+        device_statistics=tuple(stats[k] for k in sorted(stats)),
+        **_load_scalars('defaults', doc.get('defaults')))
+
+    profiles = []
+    raw_profiles = doc.get('profiles') or []
+    _require(isinstance(raw_profiles, list), 'profiles must be an array')
+    for i, entry in enumerate(raw_profiles):
+        at = 'profiles[%d]' % i
+        _known_keys(at, entry, ('name', 'match', 'defaults', 'ata',
+                                'device_statistics', 'findings'))
+        pname = entry.get('name')
+        _require(isinstance(pname, str) and pname != '',
+                 '%s/name must be a non-empty string' % at)
+        match = entry.get('match')
+        _known_keys('%s/match' % at, match, MATCH_FIELDS)
+        _require(bool(match), '%s/match must name at least one field, or the '
+                              'profile would apply to every device' % at)
+        for field, pattern in match.items():
+            _require(isinstance(pattern, str) and pattern != '',
+                     '%s/match/%s must be a non-empty pattern' % (at, field))
+        profiles.append(Profile(
+            name=pname,
+            match=dict(match),
+            ata=_load_ata('%s/ata' % at, entry.get('ata')),
+            device_statistics=_load_device_statistics(
+                '%s/device_statistics' % at, entry.get('device_statistics')),
+            findings=_load_findings('%s/findings' % at,
+                                    entry.get('findings')),
+            scalars=_load_scalars('%s/defaults' % at, entry.get('defaults'))))
+
+    return Ruleset(name=name, base=base, profiles=tuple(profiles))
+
+
+def dump_ruleset(ruleset: Ruleset) -> Dict[str, Any]:
+    """Render a ruleset back to the document form load_ruleset() accepts."""
+    def counters(rule: Any) -> Dict[str, Any]:
+        return {'absolute': rule.absolute, 'growth': rule.growth}
+
+    def stats(entries: Sequence[DevStat]) -> List[Dict[str, Any]]:
+        return [dict(name=d.name, page=d.page, offset=d.offset,
+                     supersedes=d.supersedes, **counters(d))
+                for d in entries]
+
+    return {
+        'ruleset': ruleset.name,
+        'defaults': {key: getattr(ruleset.base, key) for key in SCALARS},
+        'ata': {str(aid): dict(name=rule.name, **counters(rule))
+                for aid, rule in sorted(ruleset.base.ata.items())},
+        'device_statistics': stats(ruleset.base.device_statistics),
+        'profiles': [{'name': p.name,
+                      'match': dict(p.match),
+                      'defaults': dict(p.scalars),
+                      'findings': [{'status': st, 'reason': why}
+                                   for st, why in p.findings],
+                      'ata': {str(aid): dict(name=rule.name, **counters(rule))
+                              for aid, rule in sorted(p.ata.items())},
+                      'device_statistics': stats(p.device_statistics)}
+                     for p in ruleset.profiles],
+    }
 
 
 def get_ata_wear_level(data: Dict[Any, Any]) -> Optional[float]:
@@ -314,7 +630,9 @@ def _counter_finding(label: str,
                      absolute: Optional[int],
                      growth: Optional[int],
                      value: Optional[int],
-                     grew: Optional[int]) -> Optional[Tuple[str, str]]:
+                     grew: Optional[int],
+                     backstop: int = COUNTER_BACKSTOP
+                     ) -> Optional[Tuple[str, str]]:
     """
     Judge one counter, returning at most one finding.
 
@@ -331,7 +649,7 @@ def _counter_finding(label: str,
     if growth is not None and grew is not None and grew >= growth:
         return (WARNING, '%s grew by %d over the sample window, to %d'
                 % (label, grew, value))
-    if value >= COUNTER_BACKSTOP:
+    if value >= backstop:
         return (WARNING, '%s is %d, which is damage that predates the sample '
                          'window' % (label, value))
     return None
@@ -344,8 +662,8 @@ def _check_self_assessment(newest: Sample) -> List[Tuple[str, str]]:
 
 
 def _check_device_statistics(
-        newest: Sample,
-        oldest: Sample) -> Tuple[List[Tuple[str, str]], Set[int]]:
+        newest: Sample, oldest: Sample, rules: Rules = BUILTIN_RULES
+) -> Tuple[List[Tuple[str, str]], Set[int]]:
     """
     Apply the ACS Device Statistics rules.
 
@@ -354,7 +672,7 @@ def _check_device_statistics(
     """
     findings = []
     superseded: Set[int] = set()
-    for stat in DEVICE_STATISTICS:
+    for stat in rules.device_statistics:
         key = (stat.page, stat.offset)
         value = newest.dev_stats.get(key)
         if value is None:
@@ -364,24 +682,27 @@ def _check_device_statistics(
         finding = _counter_finding(
             '%s (device statistics page %d)' % (stat.name, stat.page),
             stat.absolute, stat.growth, value,
-            _growth(newest.dev_stats, oldest.dev_stats, key))
+            _growth(newest.dev_stats, oldest.dev_stats, key),
+            rules.counter_backstop)
         if finding:
             findings.append(finding)
     return findings, superseded
 
 
 def _check_ata(newest: Sample, oldest: Sample,
-               superseded: Optional[Set[int]] = None) -> List[Tuple[str, str]]:
+               superseded: Optional[Set[int]] = None,
+               rules: Rules = BUILTIN_RULES) -> List[Tuple[str, str]]:
     findings = []
     superseded = superseded or set()
-    for aid, rule in sorted(ATA_RULES.items()):
+    for aid, rule in sorted(rules.ata.items()):
         # a superseding statistic replaces the raw counter, but the
         # normalized threshold is still checked below
         value = None if aid in superseded else newest.ata_raw.get(aid)
         grew = None if aid in superseded \
             else _growth(newest.ata_raw, oldest.ata_raw, aid)
         finding = _counter_finding('%s (ATA %d)' % (rule.name, aid),
-                                   rule.absolute, rule.growth, value, grew)
+                                   rule.absolute, rule.growth, value, grew,
+                                   rules.counter_backstop)
         if finding:
             findings.append(finding)
 
@@ -398,7 +719,7 @@ def _check_ata(newest: Sample, oldest: Sample,
         # see NORMALIZED_HEADROOM_FRACTION
         span = _normalized_span(normalized, threshold)
         margin = normalized - threshold
-        if span > 0 and margin <= span * NORMALIZED_HEADROOM_FRACTION:
+        if span > 0 and margin <= span * rules.normalized_headroom_fraction:
             findings.append((WARNING, '%s (ATA %d) normalized value %d has '
                                       'consumed %d%% of its margin to the '
                                       'vendor threshold of %d'
@@ -408,14 +729,16 @@ def _check_ata(newest: Sample, oldest: Sample,
     return findings
 
 
-def _check_wear(newest: Sample) -> List[Tuple[str, str]]:
-    if newest.wear is not None and newest.wear >= WEAR_WARNING:
+def _check_wear(newest: Sample,
+                rules: Rules = BUILTIN_RULES) -> List[Tuple[str, str]]:
+    if newest.wear is not None and newest.wear >= rules.wear_warning:
         return [(WARNING, 'device has consumed %d%% of its rated endurance'
                  % round(newest.wear * 100))]
     return []
 
 
-def _check_nvme(newest: Sample, oldest: Sample) -> List[Tuple[str, str]]:
+def _check_nvme(newest: Sample, oldest: Sample,
+                rules: Rules = BUILTIN_RULES) -> List[Tuple[str, str]]:
     if not newest.nvme:
         return []
     findings = []
@@ -435,48 +758,54 @@ def _check_nvme(newest: Sample, oldest: Sample) -> List[Tuple[str, str]]:
         if spare <= spare_threshold:
             findings.append((BAD, 'NVMe available spare %d%% has reached the '
                                   'threshold of %d%%' % (spare, spare_threshold)))
-        elif spare <= spare_threshold + NVME_SPARE_HEADROOM:
+        elif spare <= spare_threshold + rules.nvme_spare_headroom:
             findings.append((WARNING, 'NVMe available spare %d%% is close to '
                                       'the threshold of %d%%'
                              % (spare, spare_threshold)))
 
     used = newest.nvme.get('percentage_used')
-    if used is not None and used >= NVME_USED_WARNING:
+    if used is not None and used >= rules.nvme_used_warning:
         findings.append((WARNING, 'NVMe percentage used is %d%%' % used))
 
     finding = _counter_finding(
         'NVMe media errors', None, 1, newest.nvme.get('media_errors'),
-        _growth(newest.nvme, oldest.nvme, 'media_errors'))
+        _growth(newest.nvme, oldest.nvme, 'media_errors'),
+        rules.counter_backstop)
     if finding:
         findings.append(finding)
 
     return findings
 
 
-def _check_scsi(newest: Sample, oldest: Sample) -> List[Tuple[str, str]]:
+def _check_scsi(newest: Sample, oldest: Sample,
+                rules: Rules = BUILTIN_RULES) -> List[Tuple[str, str]]:
     if not newest.scsi:
         return []
     findings = []
 
     finding = _counter_finding(
-        'SCSI grown defect list', None, SCSI_DEFECT_GROWTH,
+        'SCSI grown defect list', None, rules.scsi_defect_growth,
         newest.scsi.get('grown_defect_list'),
-        _growth(newest.scsi, oldest.scsi, 'grown_defect_list'))
+        _growth(newest.scsi, oldest.scsi, 'grown_defect_list'),
+        rules.counter_backstop)
     if finding:
         findings.append(finding)
 
     for key in ('read', 'write', 'verify'):
         field = '%s_uncorrected' % key
         finding = _counter_finding(
-            'SCSI %s uncorrected errors' % key, None, SCSI_ERROR_GROWTH,
-            newest.scsi.get(field), _growth(newest.scsi, oldest.scsi, field))
+            'SCSI %s uncorrected errors' % key, None,
+            rules.scsi_error_growth, newest.scsi.get(field),
+            _growth(newest.scsi, oldest.scsi, field),
+            rules.counter_backstop)
         if finding:
             findings.append(finding)
 
     return findings
 
 
-def predict(samples: Sequence[Dict[str, Any]]) -> Prediction:
+def predict(samples: Sequence[Dict[str, Any]],
+            ruleset: Optional[Ruleset] = None) -> Prediction:
     """
     Predict a device's health from its recent SMART samples.
 
@@ -484,40 +813,51 @@ def predict(samples: Sequence[Dict[str, Any]]) -> Prediction:
         samples -- raw smartctl JSON documents for one device, *newest
                    first*.  A single sample is enough for the absolute
                    rules; the growth rules need at least two.
+        ruleset -- rules to judge it by, defaulting to the built-in set.
 
     Returns a :class:`Prediction` whose status is one of ``Good``,
     ``Warning``, ``Bad`` or ``Unknown``.
     """
+    ruleset = ruleset or BUILTIN_RULESET
     if not samples:
         return Prediction(UNKNOWN, ['no SMART data has been collected for '
-                                    'this device'])
+                                    'this device'], ruleset.name)
+
+    # match profiles on the newest sample, so a firmware upgrade takes effect
+    rules, applied = ruleset.resolve(samples[0])
+
+    def verdict(findings: List[Tuple[str, str]]) -> Prediction:
+        status = max((f[0] for f in findings), key=lambda s: _SEVERITY[s])
+        findings.sort(key=lambda f: _SEVERITY[f[0]], reverse=True)
+        return Prediction(status, [reason for _, reason in findings],
+                          ruleset.name, tuple(applied))
 
     parsed = [s for s in (parse_sample(sample) for sample in samples)
               if s.has_data]
     if not parsed:
+        # identity findings apply even without health data
+        if rules.findings:
+            return verdict(list(rules.findings))
         # report smartctl errors, so a broken scrape is not mistaken for
         # one that never ran
         for sample in samples:
             error = smartctl_error(sample)
             if error:
                 return Prediction(UNKNOWN, ['smartctl did not return health '
-                                            'data: %s' % error])
+                                            'data: %s' % error], ruleset.name)
         return Prediction(UNKNOWN, ['no recognizable SMART health data in the '
-                                    'collected samples'])
+                                    'collected samples'], ruleset.name)
 
     newest, oldest = parsed[0], parsed[-1]
-    findings: List[Tuple[str, str]] = []
+    findings: List[Tuple[str, str]] = list(rules.findings)
     findings += _check_self_assessment(newest)
-    stat_findings, superseded = _check_device_statistics(newest, oldest)
+    stat_findings, superseded = _check_device_statistics(newest, oldest, rules)
     findings += stat_findings
-    findings += _check_ata(newest, oldest, superseded)
-    findings += _check_wear(newest)
-    findings += _check_nvme(newest, oldest)
-    findings += _check_scsi(newest, oldest)
+    findings += _check_ata(newest, oldest, superseded, rules)
+    findings += _check_wear(newest, rules)
+    findings += _check_nvme(newest, oldest, rules)
+    findings += _check_scsi(newest, oldest, rules)
 
     if not findings:
-        return Prediction(GOOD, [])
-
-    status = max((f[0] for f in findings), key=lambda s: _SEVERITY[s])
-    findings.sort(key=lambda f: _SEVERITY[f[0]], reverse=True)
-    return Prediction(status, [reason for _, reason in findings])
+        return Prediction(GOOD, [], ruleset.name, tuple(applied))
+    return verdict(findings)

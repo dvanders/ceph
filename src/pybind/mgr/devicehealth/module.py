@@ -179,6 +179,8 @@ class Module(MgrModule):
         # other
         self.run = True
         self.event = Event()
+        self._ruleset_cache: Optional[predictor.Ruleset] = None
+        self._ruleset_raw: Optional[str] = None
 
         # for mypy which does not run the code
         if TYPE_CHECKING:
@@ -293,6 +295,48 @@ class Module(MgrModule):
         Explain why the smart predictor reached its verdict for a device
         '''
         return self.explain_health(devid)
+
+    @DevicehealthCLICommand.Write('device set-predictor-ruleset')
+    def do_set_predictor_ruleset(self, inbuf: str) -> Tuple[int, str, str]:
+        '''
+        Load a SMART predictor ruleset from a file (-i <file>)
+        '''
+        if not inbuf:
+            return -errno.EINVAL, '', \
+                'no ruleset given; pass one with -i <file>'
+        try:
+            doc = json.loads(inbuf)
+        except ValueError as e:
+            return -errno.EINVAL, '', f'not valid JSON: {e}'
+        try:
+            ruleset = predictor.load_ruleset(doc)
+        except predictor.RulesetError as e:
+            return -errno.EINVAL, '', f'not a usable ruleset: {e}'
+        self.set_store('ruleset', json.dumps(doc))
+        self._ruleset_cache = None
+        self._ruleset_raw = None
+        return 0, 'loaded ruleset %s with %d profile(s)' % (
+            ruleset.name, len(ruleset.profiles)), ''
+
+    @DevicehealthCLICommand.Read('device get-predictor-ruleset')
+    def do_get_predictor_ruleset(self) -> Tuple[int, str, str]:
+        '''
+        Show the SMART predictor ruleset currently in effect
+        '''
+        doc = predictor.dump_ruleset(self._ruleset())
+        return 0, json.dumps(doc, indent=2, sort_keys=True), ''
+
+    @DevicehealthCLICommand.Write('device rm-predictor-ruleset')
+    def do_rm_predictor_ruleset(self) -> Tuple[int, str, str]:
+        '''
+        Discard an imported ruleset and return to the built-in rules
+        '''
+        if not self.get_store('ruleset'):
+            return 0, 'already using the built-in ruleset', ''
+        self.set_store('ruleset', None)
+        self._ruleset_cache = None
+        self._ruleset_raw = None
+        return 0, 'now using the built-in ruleset', ''
 
     def self_test(self) -> None:
         assert self.db_ready()
@@ -935,6 +979,24 @@ class Module(MgrModule):
         except Exception as e:
             return -errno.EIO, '', f'unable to invoke {plugin_name}: {e}'
 
+    def _ruleset(self) -> predictor.Ruleset:
+        """The imported ruleset, or the built-in one if none is stored or it
+        fails to load."""
+        raw = self.get_store('ruleset')
+        if not raw:
+            return predictor.BUILTIN_RULESET
+        if self._ruleset_cache is not None and self._ruleset_raw == raw:
+            return self._ruleset_cache
+        try:
+            ruleset = predictor.load_ruleset(json.loads(raw))
+        except (ValueError, predictor.RulesetError) as e:
+            self.log.error('stored ruleset is unusable, falling back to the '
+                           'built-in rules: %s', e)
+            ruleset = predictor.BUILTIN_RULESET
+        self._ruleset_raw = raw
+        self._ruleset_cache = ruleset
+        return ruleset
+
     def _predict_device(self, devid: str) -> predictor.Prediction:
         """
         Run the rule-based predictor over the samples in the prediction window.
@@ -944,7 +1006,7 @@ class Module(MgrModule):
         metrics = self.get_recent_device_metrics(devid, since.strftime(TIME_FORMAT))
         # TIME_FORMAT keys sort chronologically; the predictor wants newest first
         samples = [metrics[t] for t in sorted(metrics.keys(), reverse=True)]
-        prediction = predictor.predict(samples)
+        prediction = predictor.predict(samples, self._ruleset())
         self.log.debug('device %s: %s (%s sample(s)): %s', devid,
                        prediction.status, len(samples),
                        '; '.join(prediction.reasons) or 'no findings')
@@ -976,6 +1038,10 @@ class Module(MgrModule):
             lines += [f'  - {reason}' for reason in prediction.reasons]
         else:
             lines.append('  - no rule matched')
+        provenance = f'ruleset: {prediction.ruleset}'
+        if prediction.profiles:
+            provenance += ' (profile: %s)' % ', '.join(prediction.profiles)
+        lines.append(provenance)
         if self.prediction_mode() != 'smart':
             lines.append('(device_failure_prediction_mode is not "smart", so '
                          'this verdict is not being acted on)')

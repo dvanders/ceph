@@ -10,13 +10,6 @@ from devicehealth.module import (DEVICE_HEALTH, DEVICE_HEALTH_IN_USE,
                                  DEVICE_HEALTH_TOOMANY, Module)
 
 
-class FakeLog(object):
-    def _ignore(self, *args: object) -> None:
-        pass
-
-    info = debug = warning = error = _ignore
-
-
 def device(devid='Model_Serial', daemons=('osd.0',), days=7, host='node1'):
     """A device predicted to fail inside both thresholds."""
     when = datetime.now(timezone.utc) + timedelta(days=days)
@@ -39,7 +32,6 @@ def run_check(devices, osds_in, num_pgs, self_heal=True,
     :param hosts: {osd_id: host} used to place each device
     """
     m = Module.__new__(Module)
-    m._logger = FakeLog()   # MgrModule.log is a read-only property
     m.mark_out_threshold = 86400 * 7 * 2
     m.warn_threshold = 86400 * 7 * 6
     m.self_heal = self_heal
