@@ -166,6 +166,12 @@ from cephadmlib.decorators import (
     require_image
 )
 from cephadmlib.host_facts import HostFacts, list_networks, list_rdma
+from cephadmlib.host_tuning import (
+    STATUS_FAIL,
+    STATUS_WARN,
+    format_report as format_tuning_report,
+    run_checks as run_tuning_checks,
+)
 from cephadmlib.ssh import authorize_ssh_key, check_ssh_connectivity
 from cephadmlib.daemon_form import (
     DaemonForm,
@@ -4811,6 +4817,22 @@ def command_prepare_host(ctx: CephadmContext) -> None:
 ##################################
 
 
+def command_host_precheck(ctx: CephadmContext) -> int:
+    """Advisory checks of host tuning (sysctls, tuned, disks, network...)"""
+    report = run_tuning_checks(ctx, networks=ctx.network, skip=ctx.skip)
+    report['hostname'] = get_hostname()
+    if ctx.format == 'json':
+        print(json.dumps(report, indent=2))
+    else:
+        print(format_tuning_report(report))
+    summary = report['summary']
+    if summary[STATUS_FAIL] or (ctx.fail_on_warn and summary[STATUS_WARN]):
+        return 1
+    return 0
+
+##################################
+
+
 class CustomValidation(argparse.Action):
 
     def _check_name(self, values: str) -> None:
@@ -6066,6 +6088,34 @@ def _get_parser():
         '--expect-hostname',
         help='Check that hostname matches an expected value')
 
+    parser_host_precheck = subparsers.add_parser(
+        'host-precheck',
+        help='check host tuning: sysctls, tuned, CPU governor, THP, IO '
+        'schedulers, NICs and sizing (advisory)')
+    parser_host_precheck.set_defaults(func=command_host_precheck)
+    parser_host_precheck.add_argument(
+        '--network',
+        action='append',
+        default=[],
+        help='CIDR the host must have an address in, e.g. the Ceph public '
+        'or cluster network (may be repeated)')
+    parser_host_precheck.add_argument(
+        '--skip',
+        action='append',
+        default=[],
+        choices=['sysctl', 'thp', 'tuned', 'cpu_governor', 'kernel', 'swap',
+                 'disks', 'sizing', 'network'],
+        help='skip a group of checks (may be repeated)')
+    parser_host_precheck.add_argument(
+        '--fail-on-warn',
+        action='store_true',
+        help='exit non-zero if any check warns')
+    parser_host_precheck.add_argument(
+        '--format',
+        choices=['plain', 'json'],
+        default='plain',
+        help='output format')
+
     parser_prepare_host = subparsers.add_parser(
         'prepare-host', help='prepare a host for cephadm use')
     parser_prepare_host.set_defaults(func=command_prepare_host)
@@ -6343,6 +6393,7 @@ def main() -> None:
         if ctx.func not in \
                 [
                     command_check_host,
+                    command_host_precheck,
                     command_check_online,
                     command_prepare_host,
                     command_setup_ssh_user,
