@@ -166,6 +166,7 @@ from cephadmlib.decorators import (
     require_image
 )
 from cephadmlib.host_facts import HostFacts, list_networks, list_rdma
+from cephadmlib import burnin
 from cephadmlib.host_tuning import (
     STATUS_FAIL,
     STATUS_WARN,
@@ -4833,6 +4834,105 @@ def command_host_precheck(ctx: CephadmContext) -> int:
 ##################################
 
 
+def command_burnin(ctx: CephadmContext) -> int:
+    """Start, run, stop or query a CPU/memory/disk burn-in of this host"""
+    action = ctx.burnin_action
+    if action == 'list':
+        runs = burnin.list_runs()
+        if ctx.format == 'json':
+            print(json.dumps(runs, indent=2, sort_keys=True))
+        else:
+            print(burnin.format_runs(runs))
+        return 0
+    if action == 'status':
+        status = burnin.current_status(ctx, ctx.run_id)
+        if ctx.format == 'json':
+            print(json.dumps(status, indent=2, sort_keys=True))
+        else:
+            print(burnin.format_status(status))
+        return 0
+    if action == 'stop':
+        if burnin.stop_detached(ctx):
+            logger.info('Burn-in stopped')
+        else:
+            logger.info('No burn-in is running')
+        return 0
+
+    # start or run: with no explicit selection, test everything that is
+    # safe to test
+    cpu, memory = ctx.cpu, ctx.memory
+    all_available = ctx.all_available_devices
+    if not (cpu or memory or ctx.devices or all_available):
+        cpu = memory = all_available = True
+    if ctx.destructive and not ctx.yes_i_really_mean_it:
+        raise Error('--destructive overwrites every tested device; '
+                    'pass --yes-i-really-mean-it to confirm')
+    if ctx.duration <= 0:
+        raise Error('--duration must be positive')
+    if ctx.disk_bench_seconds < 0:
+        raise Error('--disk-bench-seconds must not be negative')
+    if not 0 < ctx.memory_percent <= 95:
+        raise Error('--memory-percent must be between 1 and 95')
+    devices = burnin.select_devices(
+        ctx, ctx.devices or [], all_available, ctx.destructive)
+    if not (cpu or memory or devices):
+        raise Error('nothing to test: no CPU, memory or devices selected')
+    cfg = burnin.BurninConfig(
+        duration=ctx.duration,
+        cpu=cpu,
+        memory=memory,
+        memory_percent=ctx.memory_percent,
+        devices=devices,
+        destructive=ctx.destructive,
+        workers=ctx.workers,
+        disk_bench_seconds=ctx.disk_bench_seconds,
+        resume=not ctx.from_start,
+    )
+    run_id = ctx.run_id or datetime.datetime.now(
+        datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+
+    if action == 'run' or ctx.foreground:
+        status = burnin.run_burnin(ctx, cfg, run_id)
+        if ctx.format == 'json':
+            print(json.dumps(status, indent=2, sort_keys=True))
+        else:
+            print(burnin.format_status(status))
+        return 0 if status['state'] == burnin.STATE_PASSED else 1
+
+    run_args = [
+        '--run-id', run_id,
+        '--duration', str(cfg.duration),
+        '--memory-percent', str(cfg.memory_percent),
+        '--workers', str(cfg.workers),
+        '--disk-bench-seconds', str(cfg.disk_bench_seconds),
+    ]
+    if not cfg.resume:
+        run_args.append('--from-start')
+    if cfg.cpu:
+        run_args.append('--cpu')
+    if cfg.memory:
+        run_args.append('--memory')
+    if cfg.devices:
+        run_args += ['--devices'] + cfg.devices
+    if cfg.destructive:
+        run_args += ['--destructive', '--yes-i-really-mean-it']
+    burnin.launch_detached(ctx, run_args)
+    started = {
+        'run_id': run_id,
+        'state': 'started',
+        'unit': burnin.UNIT_NAME,
+        'config': cfg.to_json(),
+    }
+    if ctx.format == 'json':
+        print(json.dumps(started, indent=2, sort_keys=True))
+    else:
+        print('Started burn-in %s for %ds (unit %s); check progress with '
+              '`cephadm burnin status`' % (run_id, cfg.duration, burnin.UNIT_NAME))
+    return 0
+
+##################################
+
+
 class CustomValidation(argparse.Action):
 
     def _check_name(self, values: str) -> None:
@@ -6116,6 +6216,75 @@ def _get_parser():
         default='plain',
         help='output format')
 
+    parser_burnin = subparsers.add_parser(
+        'burnin', help='stress test CPU, memory and disks of this host')
+    parser_burnin.set_defaults(func=command_burnin)
+    parser_burnin.add_argument(
+        'burnin_action',
+        choices=['start', 'run', 'status', 'stop', 'list'],
+        help='start: launch a detached burn-in; run: burn-in in the '
+        'foreground; status: show the last or current run; stop: stop it; '
+        'list: list the kept runs')
+    parser_burnin.add_argument(
+        '--cpu', action='store_true', help='stress the CPUs')
+    parser_burnin.add_argument(
+        '--memory', action='store_true', help='fill and verify memory')
+    parser_burnin.add_argument(
+        '--devices',
+        nargs='+',
+        help='whole-disk devices to test (never the OS disk)')
+    parser_burnin.add_argument(
+        '--all-available-devices',
+        action='store_true',
+        help='test every unused non-OS device')
+    parser_burnin.add_argument(
+        '--duration',
+        type=int,
+        default=3600,
+        help='how long to run, in seconds')
+    parser_burnin.add_argument(
+        '--memory-percent',
+        type=int,
+        default=70,
+        help='percentage of available memory to test')
+    parser_burnin.add_argument(
+        '--workers',
+        type=int,
+        default=0,
+        help='CPU worker processes (default: one per CPU)')
+    parser_burnin.add_argument(
+        '--disk-bench-seconds',
+        type=int,
+        default=burnin.DISK_BENCH_SECONDS,
+        help='before the stress phase, benchmark each disk with sequential '
+        'and then random reads for this many seconds each (0 to skip)')
+    parser_burnin.add_argument(
+        '--from-start',
+        action='store_true',
+        help='start sequential passes at the beginning of each disk instead '
+        'of where the previous burn-in stopped')
+    parser_burnin.add_argument(
+        '--destructive',
+        action='store_true',
+        help='write and verify the devices instead of only reading them; '
+        'DESTROYS ALL DATA on the tested devices')
+    parser_burnin.add_argument(
+        '--yes-i-really-mean-it',
+        action='store_true',
+        help='confirm a destructive burn-in')
+    parser_burnin.add_argument(
+        '--foreground',
+        action='store_true',
+        help='with start, run in the foreground like `run`')
+    parser_burnin.add_argument(
+        '--run-id',
+        help='with status, show this run instead of the latest')
+    parser_burnin.add_argument(
+        '--format',
+        choices=['plain', 'json'],
+        default='plain',
+        help='output format')
+
     parser_prepare_host = subparsers.add_parser(
         'prepare-host', help='prepare a host for cephadm use')
     parser_prepare_host.set_defaults(func=command_prepare_host)
@@ -6394,6 +6563,7 @@ def main() -> None:
                 [
                     command_check_host,
                     command_host_precheck,
+                    command_burnin,
                     command_check_online,
                     command_prepare_host,
                     command_setup_ssh_user,
