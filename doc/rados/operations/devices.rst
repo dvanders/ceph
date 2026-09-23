@@ -433,7 +433,7 @@ below use ``jq`` to read the JSON output.
 
    ::
 
-      compared ruleset site-2026.09 with builtin
+      compared ruleset site-2026.09 with builtin-2026.09
       1 of 412 verdict(s) would change:
         EXAMPLE_HDD-8_XXXXXXXX: Good -> Warning
 
@@ -466,7 +466,9 @@ Ruleset reference
 Top-level keys (only ``ruleset`` is required):
 
 ``ruleset``
-   A name, reported by ``ceph device explain-health``.
+   A name, reported by ``ceph device explain-health``. Names starting with
+   ``builtin`` are reserved for the rules shipped with Ceph, which are named
+   after the date they last changed, such as ``builtin-2026.09``.
 ``defaults``
    Tunables to change, from the table below.
 ``ata``

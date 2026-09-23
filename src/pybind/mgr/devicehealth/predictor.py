@@ -219,7 +219,12 @@ class Ruleset(NamedTuple):
         return rules, applied
 
 
-BUILTIN_RULESET = Ruleset(name='builtin', base=BUILTIN_RULES, profiles=())
+# Name of the built-in rules.  Change it whenever the rules change, so that
+# explain-health identifies which version produced a verdict.
+# test_devicehealth_ruleset.py fails if the rules change and the name does
+# not.
+BUILTIN_NAME = 'builtin-2026.09'
+BUILTIN_RULESET = Ruleset(name=BUILTIN_NAME, base=BUILTIN_RULES, profiles=())
 
 
 class Prediction(NamedTuple):
@@ -227,7 +232,7 @@ class Prediction(NamedTuple):
     status: str
     reasons: List[str]
     # the ruleset and profiles that produced it
-    ruleset: str = 'builtin'
+    ruleset: str = BUILTIN_NAME
     profiles: Tuple[str, ...] = ()
     disabled: Tuple[str, ...] = ()
 
@@ -445,6 +450,9 @@ def load_ruleset(doc: Any) -> Ruleset:
     name = doc.get('ruleset')
     _require(isinstance(name, str) and name != '',
              'ruleset must be a non-empty string naming this ruleset')
+    _require(not name.lower().startswith('builtin'),
+             'ruleset names starting with "builtin" are reserved for the '
+             'rules shipped with Ceph')
 
     ata = dict(BUILTIN_RULES.ata)
     ata.update(_load_ata('ata', doc.get('ata'), BUILTIN_RULES.ata, False)[0])

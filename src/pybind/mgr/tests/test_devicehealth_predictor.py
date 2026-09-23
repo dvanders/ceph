@@ -753,8 +753,8 @@ class TestRulesetCommands:
         module = self.module(health_status='Warning')
         r, out, err = module.do_set_predictor_ruleset(self.QUIET)
         assert r == 0
-        assert 'loaded ruleset quiet with 1 profile(s), replacing builtin' \
-            in out
+        assert ('loaded ruleset quiet with 1 profile(s), replacing %s'
+                % predictor.BUILTIN_NAME) in out
         assert '1 of 1 verdict(s) changed' in out
         assert 'D1: Warning -> Good' in out
         module.set_device_health_status.assert_called_once_with('D1', 'Good')
@@ -791,7 +791,8 @@ class TestRulesetCommands:
         module = self.module(health_status='Warning')
         r, out, err = module.do_test_predictor_ruleset(self.QUIET)
         assert r == 0
-        assert 'compared ruleset quiet with builtin' in out
+        assert ('compared ruleset quiet with %s'
+                % predictor.BUILTIN_NAME) in out
         assert 'D1: Warning -> Good' in out
         assert 'ruleset' not in module.store
         module.set_device_health_status.assert_not_called()

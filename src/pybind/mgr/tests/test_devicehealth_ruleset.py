@@ -262,7 +262,7 @@ def test_a_verdict_with_no_data_names_the_ruleset_but_no_profile():
 def test_a_builtin_verdict_says_so():
     result = predictor.predict([{'model_name': 'X',
                                  'smart_status': {'passed': True}}])
-    assert result.ruleset == 'builtin'
+    assert result.ruleset == predictor.BUILTIN_NAME
     assert result.profiles == ()
 
 
@@ -290,7 +290,7 @@ def module_with(stored):
 
 
 def test_no_stored_ruleset_means_the_builtin():
-    assert module_with(None)._ruleset().name == 'builtin'
+    assert module_with(None)._ruleset().name == predictor.BUILTIN_NAME
 
 
 def test_a_stored_ruleset_is_used():
@@ -309,7 +309,7 @@ def test_a_stored_ruleset_is_used():
 def test_an_unusable_stored_ruleset_falls_back_to_the_builtin(stored, why,
                                                               caplog):
     m = module_with(stored)
-    assert m._ruleset().name == 'builtin', why
+    assert m._ruleset().name == predictor.BUILTIN_NAME, why
     assert 'falling back to the built-in rules' in caplog.text
     r, out, err = m.do_get_predictor_ruleset()
     assert r == 0 and 'cannot be loaded' in err
@@ -534,3 +534,43 @@ def test_disabled_rules_round_trip():
     again = predictor.load_ruleset(predictor.dump_ruleset(first))
     assert again.profiles[0].disabled_ata == {197: 'Current_Pending_Sector'}
     assert again.profiles[0].disabled_stats == {(3, 56): ''}
+
+
+# ---------------------------------------------------------------------------
+# versioning the built-in rules
+# ---------------------------------------------------------------------------
+
+# One digest per built-in ruleset name.  When the built-in rules change, this
+# test fails: give BUILTIN_NAME in predictor.py a new name and add its digest
+# here, so explain-health tells the old and new rules apart.
+BUILTIN_DIGESTS = {
+    'builtin-2026.09':
+        'b6339f5d8ce140a3b5ca0b8fc61ace1e71cc0b7440d56ef7b2e9469a8ea86aaf',
+}
+
+
+def builtin_digest():
+    import hashlib
+    doc = predictor.dump_ruleset(predictor.BUILTIN_RULESET)
+    del doc['ruleset']
+    # engine constants that the ruleset document does not carry
+    doc['nvme_critical_warning_bits'] = predictor.NVME_CRITICAL_WARNING_BITS
+    doc['normalized_fresh_values'] = predictor.NORMALIZED_FRESH_VALUES
+    doc['wear_statistic'] = predictor.WEAR_STATISTIC
+    return hashlib.sha256(
+        json.dumps(doc, sort_keys=True).encode()).hexdigest()
+
+
+def test_the_builtin_name_changes_with_the_builtin_rules():
+    digest = builtin_digest()
+    assert BUILTIN_DIGESTS.get(predictor.BUILTIN_NAME) == digest, (
+        'the built-in rules differ from those recorded for %s: change '
+        'BUILTIN_NAME and record %s for it in BUILTIN_DIGESTS'
+        % (predictor.BUILTIN_NAME, digest))
+
+
+def test_builtin_names_are_reserved():
+    rejects(base_doc(ruleset='builtin-local'), 'reserved')
+    rejects(base_doc(ruleset='Builtin'), 'reserved')
+    dumped = predictor.dump_ruleset(predictor.BUILTIN_RULESET)
+    rejects(dumped, 'reserved')
