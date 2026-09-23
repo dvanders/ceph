@@ -275,6 +275,17 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
             desc='Raise a health warning if the host check fails'
         ),
         Option(
+            'host_precheck_on_add',
+            type='str',
+            default='warn',
+            enum_allowed=['off', 'warn', 'enforce'],
+            desc='Run the advisory host tuning checks (cephadm host-precheck) '
+            'when adding a host',
+            long_desc='off: skip the checks. warn: add the host and report any '
+            'warn or fail results. enforce: refuse to add a host with any warn '
+            'or fail result.',
+        ),
+        Option(
             'log_to_cluster',
             type='bool',
             default=True,
@@ -637,6 +648,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
             self.warn_on_stray_hosts = True
             self.warn_on_stray_daemons = True
             self.warn_on_failed_host_check = True
+            self.host_precheck_on_add = 'warn'
             self.allow_ptrace = False
             self.container_init = True
             self.prometheus_alerts_path = ''
@@ -1670,6 +1682,168 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
                     self.event.set()
         return 0, '%s (%s) ok' % (host, addr), '\n'.join(err)
 
+    def _ceph_networks(self) -> List[str]:
+        nets: List[str] = []
+        for opt in ('public_network', 'cluster_network'):
+            val = str(self.get_foreign_ceph_option('mon', opt) or '')
+            for n in val.split(','):
+                n = n.strip()
+                if '/' in n and n not in nets:
+                    nets.append(n)
+        return nets
+
+    def _run_host_precheck(self, host: str, addr: Optional[str] = None) -> Dict[str, Any]:
+        args = ['--format', 'json']
+        for net in self._ceph_networks():
+            args += ['--network', net]
+        with self.async_timeout_handler(host, 'cephadm host-precheck'):
+            out, err, code = self.wait_async(
+                CephadmServe(self)._run_cephadm(
+                    host, cephadmNoImage, 'host-precheck', args,
+                    addr=addr, error_ok=True, no_fsid=True))
+        try:
+            report = json.loads(''.join(out))
+        except ValueError:
+            report = None
+        if not isinstance(report, dict) or 'checks' not in report:
+            raise OrchestratorError(
+                f'host-precheck failed on {host} (exit {code}):\n' + '\n'.join(err))
+        return report
+
+    @staticmethod
+    def _host_precheck_problems(report: Dict[str, Any]) -> List[str]:
+        out = []
+        for r in report.get('checks', []):
+            if r.get('status') not in ('warn', 'fail'):
+                continue
+            line = '%s %s' % (r['status'].upper(), r['check'])
+            if r.get('target'):
+                line += ' ' + r['target']
+            line += ': ' + r.get('message', '')
+            if 'value' in r:
+                line += ' (value: %s' % r['value']
+                if 'expected' in r:
+                    line += ', expected: %s' % r['expected']
+                line += ')'
+            out.append(line)
+        return out
+
+    @CephadmCLICommand.Read('cephadm host-precheck')
+    def host_precheck(self, host: str, addr: Optional[str] = None,
+                      format: Format = Format.plain) -> HandleCommandResult:
+        """Check the tuning of a (possibly not yet added) host: sysctls, tuned, CPU
+        governor, THP, IO schedulers, NICs and sizing"""
+        if not addr and host in self.inventory:
+            addr = self.inventory.get_addr(host)
+        try:
+            report = self._run_host_precheck(host, addr=addr or host)
+        except (OrchestratorError, ssh.HostConnectionError) as e:
+            return HandleCommandResult(retval=1, stderr=str(e))
+        if format != Format.plain:
+            return HandleCommandResult(stdout=to_format(report, format, many=False, cls=None))
+        table = PrettyTable(['STATUS', 'CHECK', 'TARGET', 'VALUE', 'EXPECTED', 'MESSAGE'],
+                            border=False)
+        table.align = 'l'
+        table.left_padding_width = 0
+        table.right_padding_width = 2
+        for r in report.get('checks', []):
+            table.add_row((r['status'].upper(), r['check'], r.get('target', ''),
+                           r.get('value', ''), r.get('expected', ''), r.get('message', '')))
+        s = report.get('summary', {})
+        summary = ', '.join('%d %s' % (s.get(k, 0), k) for k in ('ok', 'info', 'warn', 'fail'))
+        return HandleCommandResult(stdout=table.get_string() + '\n' + summary)
+
+    def _burnin(self, host: str, args: List[str], addr: Optional[str] = None) -> HandleCommandResult:
+        # a host may be burned in before it is added, as long as it has our key
+        if not addr:
+            addr = self.inventory.get_addr(host) if host in self.inventory else host
+        try:
+            with self.async_timeout_handler(host, 'cephadm burnin ' + ' '.join(args)):
+                out, err, code = self.wait_async(
+                    CephadmServe(self)._run_cephadm(
+                        host, cephadmNoImage, 'burnin', args,
+                        addr=addr, error_ok=True, no_fsid=True))
+        except ssh.HostConnectionError as e:
+            return HandleCommandResult(retval=1, stderr=str(e))
+        if code:
+            lines = '\n'.join(err).splitlines()
+            errors = [e.replace('ERROR: ', '') for e in lines if e.startswith('ERROR')]
+            return HandleCommandResult(retval=1, stderr='\n'.join(errors or lines))
+        return HandleCommandResult(stdout=''.join(out))
+
+    @CephadmCLICommand.Write('cephadm burnin start')
+    def burnin_start(self,
+                     host: str,
+                     duration: int = 3600,
+                     cpu: bool = False,
+                     memory: bool = False,
+                     devices: Optional[List[str]] = None,
+                     all_available_devices: bool = False,
+                     memory_percent: int = 70,
+                     destructive: bool = False,
+                     yes_i_really_mean_it: bool = False,
+                     disk_bench_seconds: Optional[int] = None,
+                     from_start: bool = False,
+                     addr: Optional[str] = None) -> HandleCommandResult:
+        """Start a CPU/memory/disk burn-in on a host. With no test selected, run
+        CPU, memory and read-only tests of all unused non-OS devices.
+        --destructive write-verifies the devices and DESTROYS their data"""
+        if destructive and not yes_i_really_mean_it:
+            return HandleCommandResult(
+                retval=-errno.EPERM,
+                stderr='--destructive overwrites every tested device; '
+                'pass --yes-i-really-mean-it to confirm')
+        args = ['start', '--duration', str(duration), '--memory-percent', str(memory_percent)]
+        if cpu:
+            args.append('--cpu')
+        if memory:
+            args.append('--memory')
+        if all_available_devices:
+            args.append('--all-available-devices')
+        if devices:
+            args += ['--devices'] + devices
+        if disk_bench_seconds is not None:
+            args += ['--disk-bench-seconds', str(disk_bench_seconds)]
+        if from_start:
+            args.append('--from-start')
+        if destructive:
+            args += ['--destructive', '--yes-i-really-mean-it']
+        return self._burnin(host, args, addr)
+
+    def _burnin_query(self, host: str, args: List[str], addr: Optional[str],
+                      format: Format) -> HandleCommandResult:
+        if format == Format.plain:
+            return self._burnin(host, args, addr)
+        r = self._burnin(host, args + ['--format', 'json'], addr)
+        if r.retval:
+            return r
+        try:
+            data = json.loads(r.stdout)
+        except ValueError:
+            return HandleCommandResult(retval=1, stderr='cannot decode burn-in status')
+        return HandleCommandResult(stdout=to_format(data, format, many=False, cls=None))
+
+    @CephadmCLICommand.Read('cephadm burnin status')
+    def burnin_status(self, host: str, addr: Optional[str] = None,
+                      run_id: Optional[str] = None,
+                      format: Format = Format.plain) -> HandleCommandResult:
+        """Show the progress or result of the last (or the given) burn-in on a host"""
+        args = ['status']
+        if run_id:
+            args += ['--run-id', run_id]
+        return self._burnin_query(host, args, addr, format)
+
+    @CephadmCLICommand.Read('cephadm burnin ls')
+    def burnin_ls(self, host: str, addr: Optional[str] = None,
+                  format: Format = Format.plain) -> HandleCommandResult:
+        """List the burn-in runs kept on a host"""
+        return self._burnin_query(host, ['list'], addr, format)
+
+    @CephadmCLICommand.Write('cephadm burnin stop')
+    def burnin_stop(self, host: str, addr: Optional[str] = None) -> HandleCommandResult:
+        """Stop a running burn-in on a host"""
+        return self._burnin(host, ['stop'], addr)
+
     def _prepare_host_for_sudo_hardening(
         self,
         host: str,
@@ -2283,6 +2457,11 @@ Then run the following:
         if spec.addr == spec.hostname and ip_addr:
             spec.addr = ip_addr
 
+        # only for new hosts: re-applying a host spec must not be blocked
+        precheck_msg = ''
+        if spec.hostname not in self.inventory:
+            precheck_msg = self._host_precheck_on_add(spec.hostname, spec.addr)
+
         if spec.hostname in self.inventory and self.inventory.get_addr(spec.hostname) != spec.addr:
             self.cache.refresh_all_host_info(spec.hostname)
 
@@ -2325,7 +2504,34 @@ Then run the following:
                     f'Failed to prepare host {spec.hostname} for sudo hardening. '
                     f'Host was not added to the cluster. Error: {e}'
                 )
-        return "Added host '{}' with addr '{}'".format(spec.hostname, spec.addr)
+        msg = "Added host '{}' with addr '{}'".format(spec.hostname, spec.addr)
+        if precheck_msg:
+            msg += '\n' + precheck_msg
+        return msg
+
+    def _host_precheck_on_add(self, host: str, addr: str) -> str:
+        """Run host-precheck per host_precheck_on_add; return a message for the user."""
+        mode = self.host_precheck_on_add
+        if mode == 'off':
+            return ''
+        try:
+            report = self._run_host_precheck(host, addr=addr)
+        except Exception as e:
+            if mode == 'enforce':
+                raise OrchestratorError(f'host-precheck of {host} failed: {e}')
+            self.log.warning(f'host-precheck of {host} failed: {e}')
+            return f'host-precheck could not run: {e}'
+        problems = self._host_precheck_problems(report)
+        if not problems:
+            return ''
+        detail = '\n'.join('  ' + p for p in problems)
+        if mode == 'enforce':
+            raise OrchestratorError(
+                f'Host {host} failed host-precheck (mgr/cephadm/host_precheck_on_add=enforce):\n'
+                + detail)
+        self.log.warning(f'host-precheck of {host} found {len(problems)} issue(s):\n{detail}')
+        return (f'host-precheck found {len(problems)} issue(s); see '
+                f"'ceph cephadm host-precheck {host}':\n{detail}")
 
     @handle_orch_error
     def add_host(self, spec: HostSpec) -> str:
