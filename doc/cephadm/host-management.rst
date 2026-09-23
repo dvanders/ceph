@@ -89,6 +89,138 @@ To add each new host to the cluster, perform two steps:
       ceph orch host add host4 10.10.0.104 --labels _admin
 
 
+.. _cephadm-host-precheck:
+
+Checking Host Tuning
+====================
+
+Besides the hard requirements checked by ``cephadm check-host``, cephadm can
+run advisory checks of how well a host is tuned for Ceph:
+
+.. prompt:: bash #
+
+   ceph cephadm host-precheck <host> [--addr <ip>] [--format json]
+
+The host does not need to have been added to the cluster yet, as long as it
+has the cluster's SSH key. The checks cover:
+
+* ``sysctl`` settings such as ``vm.swappiness``, ``kernel.pid_max``,
+  ``fs.aio-max-nr`` and the TCP buffer limits. Settings that cephadm applies
+  itself when it deploys an OSD, and settings that matter only on busy or
+  fast hosts (such as the TCP buffer limits), are reported as ``info``. Use
+  :ref:`cephadm-os-tuning-profiles` to apply them.
+* the kernel command line: on AMD EPYC, whether the IOMMU is off
+  (``amd_iommu=off``), which avoids a large loss of network and NVMe
+  throughput; and whether CPU vulnerability mitigations are on.
+  ``mitigations=off`` is recommended for dedicated OSD hosts, but not for
+  hosts that also run hypervisors or other clients, so it is reported as
+  ``info``.
+* transparent huge pages, the active ``tuned`` profile, the CPU frequency
+  governor and swap (``zram`` swap is not counted, as it is compressed
+  memory rather than disk).
+* the I/O scheduler of each non-OS disk (``mq-deadline`` for HDDs, ``none``
+  for flash), HDDs with volatile write cache enabled, and disks that are
+  already in use.
+* NIC link speed and duplex, degraded bonds, and bond or VLAN members with a
+  smaller MTU than the interface stacked on them.
+* whether the host has an address in each configured ``public_network`` and
+  ``cluster_network``.
+* whether the host has enough memory and CPU threads for one OSD on each of
+  its data disks. Mounted disks are not counted.
+
+Each result is ``ok``, ``info``, ``warn`` or ``fail``. The checks can also be
+run directly on a host with ``cephadm host-precheck``, which accepts
+``--network <cidr>``, ``--skip <group>`` and ``--fail-on-warn``.
+
+``ceph orch host add`` runs these checks against every new host and appends
+any ``warn`` or ``fail`` results to its output. The
+``mgr/cephadm/host_precheck_on_add`` option controls this:
+
+* ``warn`` (default): add the host and report the problems.
+* ``enforce``: refuse to add a host that has any ``warn`` or ``fail`` result.
+* ``off``: do not run the checks.
+
+.. prompt:: bash #
+
+   ceph config set mgr mgr/cephadm/host_precheck_on_add enforce
+
+.. _cephadm-host-burnin:
+
+Burning In a Host
+=================
+
+Before a new host holds data, you can stress its CPUs, memory and disks to
+find hardware that fails early. The burn-in runs in the background on the
+host as the transient systemd unit ``ceph-burnin``, needs nothing beyond
+python, and does not require the host to have been added to the cluster.
+
+.. prompt:: bash #
+
+   ceph cephadm burnin start <host> [--duration <seconds>] [--cpu] [--memory]
+       [--devices <dev> ...] [--all-available-devices] [--memory-percent <pct>]
+   ceph cephadm burnin status <host> [--run-id <id>] [--format json]
+   ceph cephadm burnin ls <host>
+   ceph cephadm burnin stop <host>
+
+With no test selected, a burn-in runs all three for an hour (``--duration
+3600``):
+
+* ``cpu``: one process per CPU runs hashing, compression and floating point
+  loops, checking every result against a reference. A mismatch means the CPU
+  computed a wrong result.
+* ``memory``: fills ``--memory-percent`` (default 70) of the available memory
+  with changing patterns and reads it back.
+* ``disk``: sequential and random ``O_DIRECT`` reads of every unused non-OS
+  device, reporting throughput, latency and I/O errors.
+
+Before the stress phase, each disk is benchmarked on its own: sequential
+reads from the start of the disk, then random 64 KiB reads, for
+``--disk-bench-seconds`` (default 30) each, and at most a quarter of the run
+each. CPU and memory stress wait until the benchmark is done, so the numbers
+show what the disk can do alone. In the stress phase, the two patterns run
+at the same time, which makes a spinning disk seek constantly. A disk whose
+benchmark is below 80% of the median of the other disks of the same model,
+or whose p99 latency is more than twice theirs, is reported as a warning.
+
+A full sequential pass over a large HDD takes more than a day. The status
+shows each disk's pass progress and estimated time to complete it, and the
+next burn-in resumes each disk where the previous one stopped, so a series
+of shorter runs also covers the whole surface. Pass ``--from-start`` to start
+at the beginning instead.
+
+When the run ends, the host's EDAC memory error counters and CPU thermal
+throttling counters are compared with their values at the start, and the
+kernel log is searched for hardware errors. The run fails if any worker saw
+an error, an uncorrectable memory error was counted, or the kernel logged a
+hardware error. Correctable memory errors and thermal throttling are
+reported as warnings. If the host has no EDAC or thermal throttle counters,
+for example because it has no ECC memory, the result says so, because zero
+errors then proves nothing.
+
+``burnin status`` shows the latest run. The last 20 runs are kept in
+``/var/lib/ceph/burnin/runs/`` on the host: ``burnin ls`` lists them and
+``burnin status --run-id <id>`` shows one of them.
+
+To write to the disks as well as read them, pass ``--destructive``. The
+sequential worker then writes blocks that record their own offset, and
+reads them back to detect corruption and misdirected writes.
+
+.. warning::
+
+   ``--destructive`` destroys all data on the tested devices. It requires
+   ``--yes-i-really-mean-it`` and refuses any device that holds the operating
+   system, is mounted, has partitions or holders such as LVM, or has a
+   filesystem or other signature. Zap devices first with
+   ``ceph orch device zap``.
+
+.. prompt:: bash #
+
+   ceph cephadm burnin start host5 --duration 86400 --all-available-devices --destructive --yes-i-really-mean-it
+
+The same tests can be run directly on a host with ``cephadm burnin
+start|run|status|stop``. ``run`` stays in the foreground and exits non-zero
+if the burn-in fails.
+
 .. _cephadm-removing-hosts:
 
 Removing Hosts
@@ -375,6 +507,8 @@ cephadm control.
   have been removed, then you may direct cephadm to remove the CRUSH bucket
   along with the host using the ``--rm-crush-entry`` flag.
 
+
+.. _cephadm-os-tuning-profiles:
 
 OS Tuning Profiles
 ==================
