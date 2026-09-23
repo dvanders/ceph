@@ -340,13 +340,33 @@ Rulesets
 
 The built-in rules use only counters that mean the same thing across drive
 models. To add rules for a particular model, or to flag a known-bad firmware,
-load a ruleset:
+use a ruleset.
+
+To see which verdicts a ruleset would change, without loading it, run a
+command of the following form. Add a device id to see that device's full
+explanation under the new rules:
+
+.. prompt:: bash #
+
+   ceph device test-predictor-ruleset -i ruleset.json
+   ceph device test-predictor-ruleset <devid> -i ruleset.json
+
+::
+
+   compared ruleset example-2026.08 with builtin
+   1 of 412 verdict(s) would change:
+     EXAMPLE_MODEL-1_XXXXXXXX: Warning -> Good
+
+To load a ruleset, show the rules in effect, or return to the built-in rules:
 
 .. prompt:: bash #
 
    ceph device set-predictor-ruleset -i ruleset.json
    ceph device get-predictor-ruleset
    ceph device rm-predictor-ruleset
+
+When the prediction mode is ``smart``, loading or removing a ruleset
+re-judges every device immediately and lists the verdicts that changed.
 
 A ruleset is a JSON document that starts from the built-in rules. For
 example:

@@ -34,6 +34,7 @@ HEALTH_MESSAGES = {
 }
 
 DAY = 86400
+MAX_LISTED_CHANGES = 50
 WEEK = 7 * DAY
 
 # Life expectancy recorded per verdict, as (from, to) seconds from now; a
@@ -316,11 +317,13 @@ class Module(MgrModule):
             ruleset = predictor.load_ruleset(doc)
         except predictor.RulesetError as e:
             return -errno.EINVAL, '', f'not a usable ruleset: {e}'
+        previous = self._ruleset().name
         self.set_store('ruleset', json.dumps(doc))
         self._ruleset_cache = None
         self._ruleset_raw = None
-        return 0, 'loaded ruleset %s with %d profile(s)' % (
-            ruleset.name, len(ruleset.profiles)), ''
+        out = 'loaded ruleset %s with %d profile(s), replacing %s' % (
+            ruleset.name, len(ruleset.profiles), previous)
+        return 0, out + '\n' + self._reapply(), ''
 
     @DevicehealthCLICommand.Read('device get-predictor-ruleset')
     def do_get_predictor_ruleset(self) -> Tuple[int, str, str]:
@@ -341,7 +344,31 @@ class Module(MgrModule):
         self.set_store('ruleset', None)
         self._ruleset_cache = None
         self._ruleset_raw = None
-        return 0, 'now using the built-in ruleset', ''
+        return 0, 'now using the built-in ruleset\n' + self._reapply(), ''
+
+    @CLIRequiresDB
+    @DevicehealthCLICommand.Read('device test-predictor-ruleset')
+    @MgrModuleRecoverDB
+    def do_test_predictor_ruleset(self, inbuf: str,
+                                  devid: Optional[str] = None
+                                  ) -> Tuple[int, str, str]:
+        '''
+        Show what a ruleset (-i <file>) would change, without loading it
+        '''
+        if not inbuf:
+            return -errno.EINVAL, '', \
+                'no ruleset given; pass one with -i <file>'
+        try:
+            candidate = predictor.load_ruleset(json.loads(inbuf))
+        except ValueError as e:
+            return -errno.EINVAL, '', f'not a usable ruleset: {e}'
+        if devid:
+            return self.explain_health(devid, candidate)
+        changes, total = self._compare(self._ruleset(), candidate)
+        out = 'compared ruleset %s with %s\n' % (candidate.name,
+                                                 self._ruleset().name)
+        return 0, out + self._describe_changes(changes, total,
+                                               'would change'), ''
 
     def self_test(self) -> None:
         assert self.db_ready()
@@ -1019,7 +1046,9 @@ class Module(MgrModule):
         return ('the stored ruleset cannot be loaded (%s); using the built-in '
                 'rules' % self._ruleset_error)
 
-    def _predict_device(self, devid: str) -> predictor.Prediction:
+    def _predict_device(self, devid: str,
+                        ruleset: Optional[predictor.Ruleset] = None
+                        ) -> predictor.Prediction:
         """
         Run the rule-based predictor over the samples in the prediction window.
         """
@@ -1028,7 +1057,7 @@ class Module(MgrModule):
         metrics = self.get_recent_device_metrics(devid, since.strftime(TIME_FORMAT))
         # TIME_FORMAT keys sort chronologically; the predictor wants newest first
         samples = [metrics[t] for t in sorted(metrics.keys(), reverse=True)]
-        prediction = predictor.predict(samples, self._ruleset())
+        prediction = predictor.predict(samples, ruleset or self._ruleset())
         self.log.debug('device %s: %s (%s sample(s)): %s', devid,
                        prediction.status, len(samples),
                        '; '.join(prediction.reasons) or 'no findings')
@@ -1052,9 +1081,11 @@ class Module(MgrModule):
         else:
             return 0, 'unknown', ''
 
-    def explain_health(self, devid: str) -> Tuple[int, str, str]:
+    def explain_health(self, devid: str,
+                       ruleset: Optional[predictor.Ruleset] = None
+                       ) -> Tuple[int, str, str]:
         # works in any mode, so the rules can be evaluated before enabling them
-        prediction = self._predict_device(devid)
+        prediction = self._predict_device(devid, ruleset)
         lines = [f'{devid}: {prediction.status}']
         if prediction.reasons:
             lines += [f'  - {reason}' for reason in prediction.reasons]
@@ -1066,7 +1097,7 @@ class Module(MgrModule):
         lines.append(provenance)
         for rule in prediction.disabled:
             lines.append(f'disabled: {rule}')
-        if self._ruleset_error:
+        if self._ruleset_error and ruleset is None:
             lines.append(f'({self._ruleset_warning()})')
         if self.prediction_mode() != 'smart':
             lines.append('(device_failure_prediction_mode is not "smart", so '
@@ -1152,6 +1183,62 @@ class Module(MgrModule):
             self.log.info('set %s life expectancy from %s to %s (%s)',
                           devid, from_date, to_date or 'unset', status)
 
+    def _judged_devices(self) -> List[Dict[str, Any]]:
+        return [dev for dev in self.get('devices').get('devices', [])
+                if dev.get('devid') and dev.get('daemons')]
+
+    def _compare(self, current: predictor.Ruleset,
+                 candidate: predictor.Ruleset
+                 ) -> Tuple[List[Tuple[str, str, str]], int]:
+        """Devices whose verdict differs between two rulesets, as (devid,
+        current, candidate), and the number of devices judged."""
+        devs = self._judged_devices()
+        changes = []
+        for dev in devs:
+            before = self._predict_device(dev['devid'], current).status
+            after = self._predict_device(dev['devid'], candidate).status
+            if before != after:
+                changes.append((dev['devid'], before, after))
+        return changes, len(devs)
+
+    @staticmethod
+    def _describe_changes(changes: List[Tuple[str, str, str]], total: int,
+                          verb: str) -> str:
+        if not changes:
+            return f'no verdicts {verb} ({total} device(s) judged)'
+        lines = [f'{len(changes)} of {total} verdict(s) {verb}:']
+        lines += [f'  {devid}: {before} -> {after}'
+                  for devid, before, after in changes[:MAX_LISTED_CHANGES]]
+        if len(changes) > MAX_LISTED_CHANGES:
+            lines.append(f'  ... and {len(changes) - MAX_LISTED_CHANGES} more')
+        return '\n'.join(lines)
+
+    def _reapply(self) -> str:
+        """Re-judge every device now, rather than at the next scrape."""
+        if self.prediction_mode() != 'smart':
+            return ('not applied: device_failure_prediction_mode is not '
+                    '"smart"')
+        if not self.db_ready():
+            return 'will apply after the next scrape: the mgr database is ' \
+                'not ready'
+        changes, total = self._apply_all()
+        # wake the serve loop so check_health acts on the new verdicts
+        self.event.set()
+        return self._describe_changes(changes, total, 'changed')
+
+    def _apply_all(self) -> Tuple[List[Tuple[str, str, str]], int]:
+        """Judge and record every device.  Returns the verdicts that changed,
+        as (devid, before, after), and the number of devices judged."""
+        devs = self._judged_devices()
+        changes = []
+        for dev in devs:
+            status = self._predict_device(dev['devid']).status
+            before = dev.get('health_status') or predictor.UNKNOWN
+            self._apply_prediction(dev, status)
+            if before != status:
+                changes.append((dev['devid'], before, status))
+        return changes, len(devs)
+
     def predict_all_devices(self) -> Tuple[int, str, str]:
         mode = self.prediction_mode()
         if mode == 'local':
@@ -1161,11 +1248,7 @@ class Module(MgrModule):
             return 0, '', ''
 
         self.log.debug('predict_all_devices')
-        for dev in self.get('devices').get('devices', []):
-            devid = dev.get('devid')
-            if not devid or not dev.get('daemons'):
-                continue
-            self._apply_prediction(dev, self._predict_device(devid).status)
+        self._apply_all()
         return 0, '', ''
 
     def get_recent_device_metrics(self, devid: str, min_sample: str) -> Dict[str, Dict[str, Any]]:

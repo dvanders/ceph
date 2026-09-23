@@ -1,3 +1,5 @@
+import errno
+import json
 from typing import Any, Dict, Optional
 
 import pytest
@@ -723,6 +725,98 @@ class TestPredictAllDevices:
         r, out, err = module.explain_health('D1')
         assert r == 0
         assert 'not being acted on' in out
+
+
+class TestRulesetCommands:
+    """set-, rm- and test-predictor-ruleset against a stubbed module."""
+
+    build = TestPredictAllDevices.build
+
+    QUIET = json.dumps({'ruleset': 'quiet', 'profiles': [{
+        'name': 'p', 'match': {'model_name': '*'},
+        'ata': {'197': {'disabled': True}}}]})
+
+    def module(self, mode: str = 'smart', **dev_fields: Any) -> Any:
+        from unittest import mock
+        doc = ata(a197=(8, 100, 0))
+        doc['model_name'] = 'M1'
+        module = self.build([doc], mode=mode, **dev_fields)
+        store: Dict[str, Any] = {}
+        module.get_store = lambda k, d=None: store.get(k, d)
+        module.set_store = lambda k, v: (store.pop(k, None) if v is None
+                                         else store.__setitem__(k, v))
+        module.db_ready = mock.Mock(return_value=True)
+        module.store = store
+        return module
+
+    def test_loading_applies_the_ruleset_now(self) -> None:
+        module = self.module(health_status='Warning')
+        r, out, err = module.do_set_predictor_ruleset(self.QUIET)
+        assert r == 0
+        assert 'loaded ruleset quiet with 1 profile(s), replacing builtin' \
+            in out
+        assert '1 of 1 verdict(s) changed' in out
+        assert 'D1: Warning -> Good' in out
+        module.set_device_health_status.assert_called_once_with('D1', 'Good')
+        assert module.event.is_set()
+
+    def test_loading_reports_when_nothing_changes(self) -> None:
+        module = self.module(health_status='Warning')
+        r, out, err = module.do_set_predictor_ruleset(
+            json.dumps({'ruleset': 'same'}))
+        assert 'no verdicts changed (1 device(s) judged)' in out
+
+    def test_loading_in_another_mode_only_stores(self) -> None:
+        module = self.module(mode='none')
+        r, out, err = module.do_set_predictor_ruleset(self.QUIET)
+        assert r == 0 and 'not applied' in out
+        assert module.store['ruleset'] == self.QUIET
+        module.set_device_health_status.assert_not_called()
+
+    def test_loading_waits_for_the_database(self) -> None:
+        module = self.module(health_status='Warning')
+        module.db_ready.return_value = False
+        r, out, err = module.do_set_predictor_ruleset(self.QUIET)
+        assert 'will apply after the next scrape' in out
+        module.set_device_health_status.assert_not_called()
+
+    def test_removing_applies_the_builtin_rules_now(self) -> None:
+        module = self.module(health_status='Good')
+        module.store['ruleset'] = self.QUIET
+        r, out, err = module.do_rm_predictor_ruleset()
+        assert 'D1: Good -> Warning' in out
+        assert 'ruleset' not in module.store
+
+    def test_testing_a_ruleset_changes_nothing(self) -> None:
+        module = self.module(health_status='Warning')
+        r, out, err = module.do_test_predictor_ruleset(self.QUIET)
+        assert r == 0
+        assert 'compared ruleset quiet with builtin' in out
+        assert 'D1: Warning -> Good' in out
+        assert 'ruleset' not in module.store
+        module.set_device_health_status.assert_not_called()
+        module._set_device_life_expectancy.assert_not_called()
+
+    def test_testing_a_ruleset_on_one_device_explains_it(self) -> None:
+        module = self.module()
+        r, out, err = module.do_test_predictor_ruleset(self.QUIET, 'D1')
+        assert out.startswith('D1: Good')
+        assert 'ruleset: quiet' in out
+        assert 'disabled: Current_Pending_Sector (ATA 197)' in out
+
+    def test_testing_an_invalid_ruleset_is_refused(self) -> None:
+        module = self.module()
+        invalid = json.dumps({'ruleset': 'x', 'defaults': {'wear_warning': 0}})
+        for bad in ('{ not json', invalid):
+            r, out, err = module.do_test_predictor_ruleset(bad)
+            assert r == -errno.EINVAL and 'not a usable ruleset' in err
+
+    def test_a_long_list_of_changes_is_truncated(self) -> None:
+        from devicehealth.module import MAX_LISTED_CHANGES, Module
+        changes = [('D%d' % i, 'Unknown', 'Good')
+                   for i in range(MAX_LISTED_CHANGES + 5)]
+        out = Module._describe_changes(changes, len(changes), 'changed')
+        assert out.endswith('... and 5 more')
 
 
 class TestRealHardware:
