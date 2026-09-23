@@ -1417,7 +1417,9 @@ is determined by the :confval:`mgr/devicehealth/warn_threshold` config option.
 Because this alert applies only to OSDs that are currently marked ``in``, the
 appropriate response to this expected failure is (1) to mark the OSD ``out`` so
 that data is migrated off of the OSD, and then (2) to remove the hardware from
-the system. Note that this marking ``out`` is normally done automatically if
+the system. Once every OSD on the device is ``out`` and drained, the device
+moves to the ``DEVICE_HEALTH_REPLACE`` check instead. Note that this marking
+``out`` is normally done automatically if
 :confval:`mgr/devicehealth/self_heal` is enabled (as determined by
 :confval:`mgr/devicehealth/mark_out_threshold`). If an OSD device is compromised but
 the OSD(s) on that device are still ``up``, recovery can be degraded. In such
@@ -1444,6 +1446,18 @@ doesn't accomplish anything. The reason for this is that whichever tool
 originally set the stored life expectancy will probably undo your change by
 setting it again, and a change to the stored value does not affect the actual
 health of the hardware device.
+
+DEVICE_HEALTH_REPLACE
+_____________________
+
+One or more devices are expected to fail soon, and every OSD on them is
+already ``out`` and drained. They hold no data and only need to be replaced.
+
+They are reported separately from ``DEVICE_HEALTH`` so they do not hide
+devices that still hold data. A device is reported here only when *every*
+daemon on it is an OSD that is ``out`` and drained.
+
+To resolve this check, replace the device and remove its OSDs.
 
 DEVICE_HEALTH_IN_USE
 ____________________

@@ -19,10 +19,12 @@ TIME_FORMAT = '%Y%m%d-%H%M%S'
 
 DEVICE_HEALTH = 'DEVICE_HEALTH'
 DEVICE_HEALTH_IN_USE = 'DEVICE_HEALTH_IN_USE'
+DEVICE_HEALTH_REPLACE = 'DEVICE_HEALTH_REPLACE'
 DEVICE_HEALTH_TOOMANY = 'DEVICE_HEALTH_TOOMANY'
 HEALTH_MESSAGES = {
     DEVICE_HEALTH: '%d device(s) expected to fail soon',
     DEVICE_HEALTH_IN_USE: '%d daemon(s) expected to fail soon and still contain data',
+    DEVICE_HEALTH_REPLACE: '%d device(s) awaiting replacement',
     DEVICE_HEALTH_TOOMANY: 'Too many daemons are expected to fail soon',
 }
 
@@ -615,6 +617,7 @@ class Module(MgrModule):
         health_warnings: Dict[str, List[str]] = {
             DEVICE_HEALTH: [],
             DEVICE_HEALTH_IN_USE: [],
+            DEVICE_HEALTH_REPLACE: [],
         }
         devs = self.get("devices")
         osds_in = {}
@@ -640,31 +643,35 @@ class Module(MgrModule):
             self.log.debug('device %s expectancy max %s', dev,
                            life_expectancy_max)
 
+            # dev['daemons'] == ["osd.0","osd.1","osd.2"]
+            osds = [x for x in dev['daemons'] if x.startswith('osd.')]
+            osd_ids = [x[4:] for x in osds]
+
             if life_expectancy_max - now <= mark_out_threshold_td:
                 if self.self_heal:
-                    # dev['daemons'] == ["osd.0","osd.1","osd.2"]
-                    if dev['daemons']:
-                        osds = [x for x in dev['daemons']
-                                if x.startswith('osd.')]
-                        osd_ids = map(lambda x: x[4:], osds)
-                        for _id in osd_ids:
-                            if self.is_osd_in(osdmap, _id):
-                                osds_in[_id] = life_expectancy_max
-                            else:
-                                osds_out[_id] = 1
+                    for _id in osd_ids:
+                        if self.is_osd_in(osdmap, _id):
+                            osds_in[_id] = life_expectancy_max
+                        else:
+                            osds_out[_id] = 1
 
             if life_expectancy_max - now <= warn_threshold_td:
                 # device can appear in more than one location in case
                 # of SCSI multipath
-                device_locations = map(lambda x: x['host'] + ':' + x['dev'],
-                                       dev['location'])
-                health_warnings[DEVICE_HEALTH].append(
-                    '%s (%s); daemons %s; life expectancy between %s and %s'
-                    % (dev['devid'],
-                       ','.join(device_locations),
-                       ','.join(dev.get('daemons', ['none'])),
-                       dev.get('life_expectancy_min', 'unknown'),
-                       dev['life_expectancy_max']))
+                device_locations = ','.join(x['host'] + ':' + x['dev']
+                                            for x in dev['location'])
+                if self._awaiting_replacement(osdmap, dev, osds, osd_ids):
+                    health_warnings[DEVICE_HEALTH_REPLACE].append(
+                        '%s (%s); %s marked out and drained'
+                        % (dev['devid'], device_locations, ','.join(osds)))
+                else:
+                    health_warnings[DEVICE_HEALTH].append(
+                        '%s (%s); daemons %s; life expectancy between %s and %s'
+                        % (dev['devid'],
+                           device_locations,
+                           ','.join(dev.get('daemons', ['none'])),
+                           dev.get('life_expectancy_min', 'unknown'),
+                           dev['life_expectancy_max']))
 
         # OSD might be marked 'out' (which means it has no
         # data), however PGs are still attached to it.
@@ -713,6 +720,19 @@ class Module(MgrModule):
                 }
         self.set_health_checks(checks)
         return 0, "", ""
+
+    def _awaiting_replacement(self,
+                              osdmap: Dict[str, Any],
+                              dev: Dict[str, Any],
+                              osds: List[str],
+                              osd_ids: List[str]) -> bool:
+        """True if every daemon on the device is an OSD that is out and drained."""
+        if not osd_ids or len(osds) != len(dev['daemons']):
+            return False
+        if any(self.is_osd_in(osdmap, _id) for _id in osd_ids):
+            return False
+        # get_osd_num_pgs() is -1 for an OSD missing from osd_stats
+        return all(self.get_osd_num_pgs(_id) == 0 for _id in osd_ids)
 
     def is_osd_in(self, osdmap: Dict[str, Any], osd_id: str) -> bool:
         for osd in osdmap['osds']:

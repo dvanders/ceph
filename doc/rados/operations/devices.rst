@@ -199,6 +199,11 @@ The ``mgr/devicehealth/warn_threshold`` configuration option controls the
 health check for an expected device failure. If the device is expected to fail
 within the specified time interval, an alert is raised.
 
+Once every OSD on a device is ``out`` and drained, the device is reported
+under ``DEVICE_HEALTH_REPLACE`` instead of ``DEVICE_HEALTH``, because it only
+needs replacing. A device shared by several OSDs stays under
+``DEVICE_HEALTH`` while any of them is still in service.
+
 To check the stored life expectancy of all devices and generate any appropriate
 health alert, run the following command:
 

@@ -35,6 +35,11 @@
   until its upper bound, an expired one shows ``overdue``, and an open-ended
   window whose lower bound has passed shows nothing. Previously even healthy
   devices could show ``now``.
+
+* MGR: A failing device whose OSDs are all ``out`` and drained is now reported
+  under a new ``DEVICE_HEALTH_REPLACE`` health check instead of
+  ``DEVICE_HEALTH``, so it does not hide devices that still hold data.
+
 * MGR: The ``cloud`` value of ``device_failure_prediction_mode`` has been
   removed; the ``diskprediction_cloud`` module it selected no longer exists.
   Clusters with it set should switch to ``local`` or ``none``.
