@@ -22,11 +22,14 @@ LIFE_EXPECTANCY_FORMAT = '%Y-%m-%dT%H:%M:%S'
 DEVICE_HEALTH = 'DEVICE_HEALTH'
 DEVICE_HEALTH_IN_USE = 'DEVICE_HEALTH_IN_USE'
 DEVICE_HEALTH_REPLACE = 'DEVICE_HEALTH_REPLACE'
+DEVICE_HEALTH_RULESET_INVALID = 'DEVICE_HEALTH_RULESET_INVALID'
 DEVICE_HEALTH_TOOMANY = 'DEVICE_HEALTH_TOOMANY'
 HEALTH_MESSAGES = {
     DEVICE_HEALTH: '%d device(s) expected to fail soon',
     DEVICE_HEALTH_IN_USE: '%d daemon(s) expected to fail soon and still contain data',
     DEVICE_HEALTH_REPLACE: '%d device(s) awaiting replacement',
+    DEVICE_HEALTH_RULESET_INVALID: 'Stored predictor ruleset cannot be loaded; '
+                                   'using the built-in rules',
     DEVICE_HEALTH_TOOMANY: 'Too many daemons are expected to fail soon',
 }
 
@@ -181,6 +184,7 @@ class Module(MgrModule):
         self.event = Event()
         self._ruleset_cache: Optional[predictor.Ruleset] = None
         self._ruleset_raw: Optional[str] = None
+        self._ruleset_error: Optional[str] = None
 
         # for mypy which does not run the code
         if TYPE_CHECKING:
@@ -324,7 +328,8 @@ class Module(MgrModule):
         Show the SMART predictor ruleset currently in effect
         '''
         doc = predictor.dump_ruleset(self._ruleset())
-        return 0, json.dumps(doc, indent=2, sort_keys=True), ''
+        return 0, json.dumps(doc, indent=2, sort_keys=True), \
+            self._ruleset_warning()
 
     @DevicehealthCLICommand.Write('device rm-predictor-ruleset')
     def do_rm_predictor_ruleset(self) -> Tuple[int, str, str]:
@@ -814,6 +819,14 @@ class Module(MgrModule):
                     'count': len(ls),
                     'detail': ls,
                 }
+        self._ruleset()
+        if self._ruleset_error:
+            checks[DEVICE_HEALTH_RULESET_INVALID] = {
+                'severity': 'warning',
+                'summary': HEALTH_MESSAGES[DEVICE_HEALTH_RULESET_INVALID],
+                'count': 1,
+                'detail': [self._ruleset_error],
+            }
         self.set_health_checks(checks)
         return 0, "", ""
 
@@ -984,18 +997,27 @@ class Module(MgrModule):
         fails to load."""
         raw = self.get_store('ruleset')
         if not raw:
+            self._ruleset_error = None
             return predictor.BUILTIN_RULESET
         if self._ruleset_cache is not None and self._ruleset_raw == raw:
             return self._ruleset_cache
+        self._ruleset_error = None
         try:
             ruleset = predictor.load_ruleset(json.loads(raw))
         except (ValueError, predictor.RulesetError) as e:
             self.log.error('stored ruleset is unusable, falling back to the '
                            'built-in rules: %s', e)
+            self._ruleset_error = str(e)
             ruleset = predictor.BUILTIN_RULESET
         self._ruleset_raw = raw
         self._ruleset_cache = ruleset
         return ruleset
+
+    def _ruleset_warning(self) -> str:
+        if not self._ruleset_error:
+            return ''
+        return ('the stored ruleset cannot be loaded (%s); using the built-in '
+                'rules' % self._ruleset_error)
 
     def _predict_device(self, devid: str) -> predictor.Prediction:
         """
@@ -1044,6 +1066,8 @@ class Module(MgrModule):
         lines.append(provenance)
         for rule in prediction.disabled:
             lines.append(f'disabled: {rule}')
+        if self._ruleset_error:
+            lines.append(f'({self._ruleset_warning()})')
         if self.prediction_mode() != 'smart':
             lines.append('(device_failure_prediction_mode is not "smart", so '
                          'this verdict is not being acted on)')

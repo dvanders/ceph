@@ -281,6 +281,7 @@ def module_with(stored):
     m = Module.__new__(Module)
     m._ruleset_cache = None
     m._ruleset_raw = None
+    m._ruleset_error = None
     m.store = {} if stored is None else {'ruleset': stored}
     m.get_store = lambda k, d=None: m.store.get(k, d)
     m.set_store = lambda k, v: (m.store.pop(k, None) if v is None
@@ -307,8 +308,11 @@ def test_a_stored_ruleset_is_used():
 ])
 def test_an_unusable_stored_ruleset_falls_back_to_the_builtin(stored, why,
                                                               caplog):
-    assert module_with(stored)._ruleset().name == 'builtin', why
+    m = module_with(stored)
+    assert m._ruleset().name == 'builtin', why
     assert 'falling back to the built-in rules' in caplog.text
+    r, out, err = m.do_get_predictor_ruleset()
+    assert r == 0 and 'cannot be loaded' in err
 
 
 def test_the_ruleset_is_cached_but_notices_a_change():

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from devicehealth.module import (DEVICE_HEALTH, DEVICE_HEALTH_IN_USE,
                                  DEVICE_HEALTH_REPLACE,
+                                 DEVICE_HEALTH_RULESET_INVALID,
                                  DEVICE_HEALTH_TOOMANY, Module)
 
 
@@ -38,6 +39,9 @@ def run_check(devices, osds_in, num_pgs, self_heal=True,
     m.mark_out_max_concurrent = max_concurrent
     m.mark_out_min_interval = min_interval
     m.marked_out = []
+    m._ruleset_cache = None
+    m._ruleset_raw = None
+    m._ruleset_error = None
     m.store = dict(store or {})
     m.get_store = lambda k, default=None: m.store.get(k, default)
     m.set_store = lambda k, v: m.store.__setitem__(k, v)
@@ -443,3 +447,32 @@ def test_raising_the_limit_lets_a_far_away_device_through():
                      store={'mark_out_history': history})
     # node1 is busy draining, so only the device on node9 is eligible
     assert m.marked_out == ['99']
+
+
+# ---------------------------------------------------------------------------
+# a stored ruleset that no longer loads
+# ---------------------------------------------------------------------------
+
+def test_an_unloadable_ruleset_raises_a_health_warning():
+    bad = json.dumps({'ruleset': 'site', 'defaults': {'wear_warning': 0}})
+    _, checks = run_check([], osds_in={}, num_pgs={},
+                          store={'ruleset': bad})
+    check = checks[DEVICE_HEALTH_RULESET_INVALID]
+    assert 'built-in rules' in check['summary']
+    assert 'wear_warning' in check['detail'][0]
+
+
+def test_a_loadable_ruleset_raises_nothing():
+    _, checks = run_check([], osds_in={}, num_pgs={},
+                          store={'ruleset': json.dumps({'ruleset': 'site'})})
+    assert DEVICE_HEALTH_RULESET_INVALID not in checks
+
+
+def test_the_warning_clears_when_the_ruleset_is_removed():
+    m, checks = run_check([], osds_in={}, num_pgs={},
+                          store={'ruleset': '{ not json'})
+    assert DEVICE_HEALTH_RULESET_INVALID in checks
+    del m.store['ruleset']
+    checks.clear()
+    m.check_health()
+    assert DEVICE_HEALTH_RULESET_INVALID not in checks

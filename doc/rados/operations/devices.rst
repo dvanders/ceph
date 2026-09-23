@@ -495,8 +495,8 @@ verdict::
 
 A ruleset is validated when it is loaded. Unknown keys, thresholds below 1,
 and tunables outside their ranges are rejected. If a stored ruleset
-later fails to load, for example after a downgrade, the module logs an error
-and uses the built-in rules.
+later fails to load, for example after a downgrade, the module uses the
+built-in rules and raises ``DEVICE_HEALTH_RULESET_INVALID``.
 
 .. note:: A ruleset changes which OSDs ``self_heal`` marks ``out``. The rate
    limits under `Automatic Migration`_ still apply.

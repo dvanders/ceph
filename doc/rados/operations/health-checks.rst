@@ -1459,6 +1459,22 @@ daemon on it is an OSD that is ``out`` and drained.
 
 To resolve this check, replace the device and remove its OSDs.
 
+DEVICE_HEALTH_RULESET_INVALID
+_____________________________
+
+The SMART predictor ruleset loaded with ``ceph device set-predictor-ruleset``
+can no longer be loaded, for example after an upgrade or downgrade changed
+what is valid. Until this is fixed, devices are judged by the built-in rules.
+The health detail gives the reason.
+
+To resolve this check, fix the ruleset and load it again, or return to the
+built-in rules:
+
+.. prompt:: bash #
+
+   ceph device set-predictor-ruleset -i ruleset.json
+   ceph device rm-predictor-ruleset
+
 DEVICE_HEALTH_IN_USE
 ____________________
 

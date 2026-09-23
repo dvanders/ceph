@@ -63,7 +63,8 @@
   change thresholds, add or replace rules, and define per-model profiles that
   disable rules or assert verdicts for known-bad models or firmware.
   ``ceph device get-predictor-ruleset`` shows the rules in effect and
-  ``ceph device rm-predictor-ruleset`` restores the built-in ones.
+  ``ceph device rm-predictor-ruleset`` restores the built-in ones. A stored
+  ruleset that fails to load raises ``DEVICE_HEALTH_RULESET_INVALID``.
 
 * MGR: ``ceph device ls``, ``ls-by-host`` and ``ls-by-daemon`` have a new
   ``HEALTH`` column showing the failure predictor's verdict (``Good``,
