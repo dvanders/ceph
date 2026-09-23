@@ -237,13 +237,29 @@ band in ``LIFE EXPECTANCY``:
 ``mark_out_threshold`` and ``warn_threshold`` act on ``LIFE EXPECTANCY``,
 which is also where ``ceph device set-life-expectancy`` writes.
 
-The verdicts are risk tiers, not countdowns. On the Backblaze Q1 2026
-drive-stats data (351,095 drives and 1,030 failures over 90 days):
+The verdicts are risk tiers, not countdowns. On the Backblaze drive-stats data
+for the first two quarters of 2026 (about 355,000 drives and 1,000 to 1,500
+failures per quarter), measured with ``src/script/score_smart_predictor.py``:
 
-* 4.4% of ``Warning`` devices failed within six weeks, compared with 0.05% of
-  unflagged devices.
-* 11% of ``Bad`` devices failed within two weeks, compared with 0.02% of
-  unflagged devices. This is based on a sample of 62 devices.
++-----------------------------------------------------+-------------+-------------+
+|                                                     | Q1 2026     | Q2 2026     |
++=====================================================+=============+=============+
+| Drives flagged at some point in the quarter         | 4.4%        | 4.6%        |
++-----------------------------------------------------+-------------+-------------+
+| Failures flagged beforehand                         | 75.5%       | 79.2%       |
++-----------------------------------------------------+-------------+-------------+
+| Median days between first flag and failure          | 38          | 26          |
++-----------------------------------------------------+-------------+-------------+
+| ``Warning`` devices that failed within six weeks    | 3.0%        | 5.9%        |
++-----------------------------------------------------+-------------+-------------+
+| ``Bad`` devices that failed within two weeks        | 9.7% of 62  | 12.9% of 70 |
++-----------------------------------------------------+-------------+-------------+
+| Unflagged devices that failed within six weeks      | 0.04%       | 0.05%       |
++-----------------------------------------------------+-------------+-------------+
+
+A flagged device was about 17 times likelier to fail than the average device
+in both quarters. Most failures that were not flagged had every monitored
+counter at zero on their last day: they gave no SMART warning to find.
 
 Read ``Bad`` as "move the data off this device first", not as "this device
 has two weeks left".
@@ -597,6 +613,36 @@ built-in rules and raises ``DEVICE_HEALTH_RULESET_INVALID``.
 
 .. note:: A ruleset changes which OSDs ``self_heal`` marks ``out``. The rate
    limits under `Automatic Migration`_ still apply.
+
+Improving the built-in rules
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The built-in rules are in ``src/pybind/mgr/devicehealth/predictor.py``. They
+must mean the same thing on every drive model. A rule that is right for one
+model family and wrong for another belongs in a ruleset profile instead.
+
+To propose a change, measure it against a quarter of the `Backblaze
+drive-stats data <https://www.backblaze.com/cloud-storage/resources/hard-drive-test-data>`_
+with ``src/script/score_smart_predictor.py``. It needs only Python and reads
+the quarter's zip file directly. Write the change as a ruleset first, and
+compare it with the built-in rules:
+
+.. prompt:: bash $
+
+   src/script/score_smart_predictor.py data_Q1_2026.zip --ruleset candidate.json
+
+The report gives, for each ruleset, the share of drives flagged, the share of
+failures flagged and how many days ahead, and how much likelier a flagged
+drive is to fail than the average. It then counts the drives and failures
+whose outcome the candidate changes. Include this output in the pull request.
+
+The data has limits, and the script lists them: it holds ATA attributes only,
+with no vendor thresholds apart from helium, and Backblaze retires some drives
+because of these same attributes.
+
+When the change moves into ``predictor.py``, give ``BUILTIN_NAME`` a new name.
+A unit test records a digest of the built-in rules for each name, and fails
+with the new digest to record when the rules change without a new name.
 
 Health alerts
 -------------
