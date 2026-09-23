@@ -412,3 +412,121 @@ def test_findings_round_trip():
     doc = predictor.dump_ruleset(rs)
     again = predictor.load_ruleset(doc)
     assert again.profiles[0].findings == rs.profiles[0].findings
+
+
+# ---------------------------------------------------------------------------
+# scalar limits: no accepted value may flag a new, healthy device
+# ---------------------------------------------------------------------------
+
+def fresh_devices():
+    """A new SATA SSD, NVMe drive and HDD, all healthy."""
+    ssd = {'smart_status': {'passed': True},
+           'ata_device_statistics': {'pages': [{'number': 7, 'table': [
+               {'offset': 8, 'value': 1, 'flags': {'valid': True}}]}]}}
+    nvme = {'smart_status': {'passed': True},
+            'nvme_smart_health_information_log': {
+                'critical_warning': 0, 'available_spare': 100,
+                'available_spare_threshold': 10, 'percentage_used': 1,
+                'media_errors': 0}}
+    hdd = {'smart_status': {'passed': True},
+           'ata_smart_attributes': {'table': [
+               {'id': 5, 'value': 100, 'thresh': 10,
+                'raw': {'value': 0, 'string': '0'}},
+               {'id': 184, 'value': 100, 'thresh': 90,
+                'raw': {'value': 0, 'string': '0'}}]}}
+    return [ssd, nvme, hdd]
+
+
+@pytest.mark.parametrize('scalar,value', [
+    ('wear_warning', 0.0),
+    ('nvme_used_warning', 1),
+    ('nvme_spare_headroom', 100),
+    ('normalized_headroom_fraction', 1.0),
+])
+def test_scalars_that_would_flag_a_new_device_are_refused(scalar, value):
+    rejects(base_doc(defaults={scalar: value}), scalar)
+
+
+@pytest.mark.parametrize('scalar', sorted(predictor.SCALARS))
+def test_the_most_aggressive_accepted_value_leaves_new_devices_good(scalar):
+    _, low, high = predictor._SCALAR_LIMITS[scalar]
+    # thresholds that warn when a value is high are most aggressive at their
+    # minimum; margins that warn when a value is close are at their maximum
+    value = high if scalar in ('normalized_headroom_fraction',
+                               'nvme_spare_headroom') else low
+    rs = predictor.load_ruleset(base_doc(defaults={scalar: value}))
+    for doc in fresh_devices():
+        assert predictor.predict([doc, doc], rs).status == predictor.GOOD, \
+            (scalar, value, doc)
+
+
+# ---------------------------------------------------------------------------
+# turning rules off
+# ---------------------------------------------------------------------------
+
+def pending(model='TOSHIBA MG07ACA14TE', value=50):
+    return {'model_name': model, 'smart_status': {'passed': True},
+            'ata_smart_attributes': {'table': [
+                {'id': 197, 'value': 100, 'thresh': 0,
+                 'raw': {'value': value, 'string': str(value)}}]}}
+
+
+def test_a_rule_without_thresholds_cannot_replace_a_counter():
+    rejects(base_doc(ata={'197': {'name': 'Current_Pending_Sector'}}),
+            '"disabled": true')
+    rejects(base_doc(profiles=[{
+        'name': 'p', 'match': {'model_name': 'X*'},
+        'ata': {'197': {'name': 'Current_Pending_Sector'}}}]),
+        '"disabled": true')
+    rejects(base_doc(device_statistics=[
+        {'name': 'x', 'page': 3, 'offset': 56}]), '"disabled": true')
+
+
+def test_a_new_level_rule_needs_no_thresholds():
+    rs = predictor.load_ruleset(base_doc(ata={'230': {'name': 'Level'}}))
+    assert rs.base.ata[230] == predictor.AtaRule('Level', None, None)
+
+
+def test_a_profile_can_disable_a_rule_for_its_devices():
+    rs = predictor.load_ruleset(base_doc(profiles=[{
+        'name': 'noisy-197', 'match': {'model_name': 'TOSHIBA*'},
+        'ata': {'197': {'disabled': True}}}]))
+    result = predictor.predict([pending()], rs)
+    assert result.status == predictor.GOOD
+    assert result.disabled == \
+        ('Current_Pending_Sector (ATA 197) by profile noisy-197',)
+    # other models are still judged
+    other = predictor.predict([pending(model='WDC WUH721816ALE6L4')], rs)
+    assert other.status == predictor.WARNING
+    assert other.disabled == ()
+
+
+def test_a_profile_can_disable_a_device_statistic():
+    rs = predictor.load_ruleset(base_doc(profiles=[{
+        'name': 'p', 'match': {'model_name': 'X*'},
+        'device_statistics': [{'page': 3, 'offset': 56, 'disabled': True}]}]))
+    rules, _ = rs.resolve({'model_name': 'X1'})
+    assert (3, 56) not in {(d.page, d.offset) for d in rules.device_statistics}
+    assert 'page 3 offset 56' in rules.disabled[0]
+
+
+def test_disabling_is_only_allowed_in_a_profile():
+    rejects(base_doc(ata={'197': {'disabled': True}}),
+            'only allowed in a profile')
+
+
+def test_a_disabled_rule_takes_no_thresholds():
+    rejects(base_doc(profiles=[{
+        'name': 'p', 'match': {'model_name': 'X*'},
+        'ata': {'197': {'disabled': True, 'growth': 1}}}]), 'unknown key')
+
+
+def test_disabled_rules_round_trip():
+    doc = base_doc(profiles=[{
+        'name': 'p', 'match': {'model_name': 'X*'},
+        'ata': {'197': {'name': 'Current_Pending_Sector', 'disabled': True}},
+        'device_statistics': [{'page': 3, 'offset': 56, 'disabled': True}]}])
+    first = predictor.load_ruleset(doc)
+    again = predictor.load_ruleset(predictor.dump_ruleset(first))
+    assert again.profiles[0].disabled_ata == {197: 'Current_Pending_Sector'}
+    assert again.profiles[0].disabled_stats == {(3, 56): ''}

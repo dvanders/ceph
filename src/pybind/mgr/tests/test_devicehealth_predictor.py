@@ -701,6 +701,23 @@ class TestPredictAllDevices:
         assert out.startswith('D1: Warning')
         assert 'Current_Pending_Sector' in out
 
+    def test_explain_health_lists_disabled_rules(self) -> None:
+        import json
+        from unittest import mock
+        module = self.build([ata(a197=(8, 100, 0))])
+        module.get_store = mock.Mock(return_value=json.dumps({
+            'ruleset': 'site', 'profiles': [{
+                'name': 'quiet', 'match': {'model_name': '*'},
+                'ata': {'197': {'disabled': True}}}]}))
+        doc = ata(a197=(8, 100, 0))
+        doc['model_name'] = 'M1'
+        module.get_recent_device_metrics = mock.Mock(
+            return_value={'20260101-000000': doc})
+        r, out, err = module.explain_health('D1')
+        assert out.startswith('D1: Good')
+        assert 'disabled: Current_Pending_Sector (ATA 197) by profile quiet' \
+            in out
+
     def test_explain_health_flags_an_inactive_mode(self) -> None:
         module = self.build([ata(a197=(8, 100, 0))], mode='none')
         r, out, err = module.explain_health('D1')

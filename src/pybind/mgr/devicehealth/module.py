@@ -1042,6 +1042,8 @@ class Module(MgrModule):
         if prediction.profiles:
             provenance += ' (profile: %s)' % ', '.join(prediction.profiles)
         lines.append(provenance)
+        for rule in prediction.disabled:
+            lines.append(f'disabled: {rule}')
         if self.prediction_mode() != 'smart':
             lines.append('(device_failure_prediction_mode is not "smart", so '
                          'this verdict is not being acted on)')

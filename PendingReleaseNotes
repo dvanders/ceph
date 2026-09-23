@@ -60,8 +60,8 @@
 
 * MGR: The ``devicehealth`` SMART predictor's rules can be extended with a
   JSON ruleset: ``ceph device set-predictor-ruleset -i <file>``. A ruleset can
-  change thresholds, add or replace rules, and define per-model profiles,
-  including verdicts for known-bad models or firmware.
+  change thresholds, add or replace rules, and define per-model profiles that
+  disable rules or assert verdicts for known-bad models or firmware.
   ``ceph device get-predictor-ruleset`` shows the rules in effect and
   ``ceph device rm-predictor-ruleset`` restores the built-in ones.
 

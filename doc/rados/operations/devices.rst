@@ -401,39 +401,63 @@ offset. A rule has these keys:
 ``supersedes``
    Only for ``device_statistics``: the SMART attribute id whose raw counter
    this statistic replaces.
+``disabled``
+   Only in a profile: set to ``true`` to turn the rule off for the profile's
+   devices. The rule is identified by its attribute id, or by ``page`` and
+   ``offset``, and takes no other keys except ``name``. ``ceph device
+   explain-health`` lists the rules that are disabled for a device.
 
-A rule with neither ``absolute`` nor ``growth`` treats the raw value as a
+A new rule with neither ``absolute`` nor ``growth`` treats the raw value as a
 level rather than a count. Only its vendor-threshold margin is checked, and
-``counter_backstop`` does not apply. The helium rules are defined this way.
+``counter_backstop`` does not apply. The helium rules are defined this way. A
+rule without thresholds cannot replace a rule that has one; use ``disabled``
+instead.
 
-``defaults`` may set these tunables, in a ruleset or a profile:
+For example, to stop judging ``Current_Pending_Sector`` on one model:
 
-+----------------------------------+---------+---------------------------------+
-| Key                              | Default | Meaning                         |
-+==================================+=========+=================================+
-| ``counter_backstop``             | 256     | Warn on any defect counter at   |
-|                                  |         | or above this value.            |
-+----------------------------------+---------+---------------------------------+
-| ``normalized_headroom_fraction`` | 0.1     | Warn when the margin to the     |
-|                                  |         | vendor threshold is at most     |
-|                                  |         | this fraction of the range.     |
-+----------------------------------+---------+---------------------------------+
-| ``wear_warning``                 | 0.9     | Warn at this fraction of rated  |
-|                                  |         | write endurance.                |
-+----------------------------------+---------+---------------------------------+
-| ``nvme_spare_headroom``          | 10      | Warn when NVMe available spare  |
-|                                  |         | is within this many points of   |
-|                                  |         | its threshold.                  |
-+----------------------------------+---------+---------------------------------+
-| ``nvme_used_warning``            | 90      | Warn at this NVMe               |
-|                                  |         | ``percentage_used``.            |
-+----------------------------------+---------+---------------------------------+
-| ``scsi_defect_growth``           | 1       | SAS grown defect list growth    |
-|                                  |         | that warns.                     |
-+----------------------------------+---------+---------------------------------+
-| ``scsi_error_growth``            | 1       | SAS uncorrected error growth    |
-|                                  |         | that warns.                     |
-+----------------------------------+---------+---------------------------------+
+.. code-block:: json
+
+   {
+     "ruleset": "example-2026.08",
+     "profiles": [
+       {
+         "name": "quiet-pending",
+         "match": {"model_name": "EXAMPLE MODEL-1*"},
+         "ata": {"197": {"disabled": true}}
+       }
+     ]
+   }
+
+``defaults`` may set these tunables, in a ruleset or a profile. Values outside
+the allowed range are rejected. The ranges ensure that no accepted value flags
+a new, healthy device.
+
++----------------------------------+---------+-----------+-------------------------------+
+| Key                              | Default | Range     | Meaning                       |
++==================================+=========+===========+===============================+
+| ``counter_backstop``             | 256     | 1 or more | Warn on any defect counter at |
+|                                  |         |           | or above this value.          |
++----------------------------------+---------+-----------+-------------------------------+
+| ``normalized_headroom_fraction`` | 0.1     | 0 to 0.5  | Warn when the margin to the   |
+|                                  |         |           | vendor threshold is at most   |
+|                                  |         |           | this fraction of the range.   |
++----------------------------------+---------+-----------+-------------------------------+
+| ``wear_warning``                 | 0.9     | 0.5 to 1  | Warn at this fraction of      |
+|                                  |         |           | rated write endurance.        |
++----------------------------------+---------+-----------+-------------------------------+
+| ``nvme_spare_headroom``          | 10      | 0 to 50   | Warn when NVMe available      |
+|                                  |         |           | spare is within this many     |
+|                                  |         |           | points of its threshold.      |
++----------------------------------+---------+-----------+-------------------------------+
+| ``nvme_used_warning``            | 90      | 50 to 255 | Warn at this NVMe             |
+|                                  |         |           | ``percentage_used``.          |
++----------------------------------+---------+-----------+-------------------------------+
+| ``scsi_defect_growth``           | 1       | 1 or more | SAS grown defect list growth  |
+|                                  |         |           | that warns.                   |
++----------------------------------+---------+-----------+-------------------------------+
+| ``scsi_error_growth``            | 1       | 1 or more | SAS uncorrected error growth  |
+|                                  |         |           | that warns.                   |
++----------------------------------+---------+-----------+-------------------------------+
 
 A profile's ``match`` may name ``model_name``, ``model_family``,
 ``firmware_version``, ``vendor`` and ``product``. Each is a case-insensitive
@@ -459,8 +483,8 @@ A profile can also assert a verdict from the device's identity alone:
    }
 
 These findings apply even when the device returns no usable SMART data. Only
-``Warning`` and ``Bad`` can be asserted, so a ruleset cannot hide a failure.
-Findings are allowed only in profiles.
+``Warning`` and ``Bad`` can be asserted, and findings are allowed only in
+profiles.
 
 ``ceph device explain-health`` reports the ruleset and profiles behind a
 verdict::
@@ -469,8 +493,8 @@ verdict::
      - Spindle Speed Deviations (device statistics page 3) grew by 3 ...
    ruleset: example-2026.08 (profile: toshiba-mg07)
 
-A ruleset is validated when it is loaded. Unknown keys and values that would
-flag every device, such as a growth of 0, are rejected. If a stored ruleset
+A ruleset is validated when it is loaded. Unknown keys, thresholds below 1,
+and tunables outside their ranges are rejected. If a stored ruleset
 later fails to load, for example after a downgrade, the module logs an error
 and uses the built-in rules.
 

@@ -126,6 +126,8 @@ class Rules(NamedTuple):
     nvme_used_warning: int
     scsi_defect_growth: int
     scsi_error_growth: int
+    # rules turned off by a profile, for explain-health
+    disabled: Tuple[str, ...] = ()
 
 
 # The tunable scalars, by the name a ruleset document uses for each.
@@ -162,6 +164,9 @@ class Profile(NamedTuple):
     device_statistics: Tuple[DevStat, ...]
     findings: Tuple[Tuple[str, str], ...]
     scalars: Mapping[str, Any]
+    # rules this profile turns off: ATA id -> name, (page, offset) -> name
+    disabled_ata: Mapping[int, str] = {}
+    disabled_stats: Mapping[Tuple[int, int], str] = {}
 
     def matches(self, data: Dict[str, Any]) -> bool:
         # every named field must match; a missing field never matches
@@ -193,10 +198,23 @@ class Ruleset(NamedTuple):
             stats = {(d.page, d.offset): d for d in rules.device_statistics}
             for stat in profile.device_statistics:
                 stats[(stat.page, stat.offset)] = stat
+            disabled = list(rules.disabled)
+            for aid, name in sorted(profile.disabled_ata.items()):
+                rule = ata.pop(aid, None)
+                disabled.append('%s (ATA %d) by profile %s'
+                                % (name or (rule.name if rule else '?'),
+                                   aid, profile.name))
+            for key, name in sorted(profile.disabled_stats.items()):
+                stat = stats.pop(key, None)
+                disabled.append('%s (device statistics page %d offset %d) '
+                                'by profile %s'
+                                % (name or (stat.name if stat else '?'),
+                                   key[0], key[1], profile.name))
             rules = rules._replace(
                 ata=ata,
                 device_statistics=tuple(stats[k] for k in sorted(stats)),
                 findings=rules.findings + profile.findings,
+                disabled=tuple(disabled),
                 **profile.scalars)
         return rules, applied
 
@@ -211,6 +229,7 @@ class Prediction(NamedTuple):
     # the ruleset and profiles that produced it
     ruleset: str = 'builtin'
     profiles: Tuple[str, ...] = ()
+    disabled: Tuple[str, ...] = ()
 
 
 class Sample(NamedTuple):
@@ -235,14 +254,16 @@ class RulesetError(ValueError):
     """A ruleset document was rejected."""
 
 
-# (type, min, max) per scalar.  A typo such as a backstop of 0 would
-# otherwise flag every device.
+# (type, min, max) per scalar.  The bounds keep a new, healthy device from
+# being flagged: counters at zero, wear and percentage used near 0%, NVMe
+# spare at 100% against a typical threshold of 10%, and normalized values at
+# their fresh value.
 _SCALAR_LIMITS: Dict[str, Tuple[type, Any, Any]] = {
     'counter_backstop': (int, 1, None),
-    'normalized_headroom_fraction': (float, 0.0, 1.0),
-    'wear_warning': (float, 0.0, 1.0),
-    'nvme_spare_headroom': (int, 0, 100),
-    'nvme_used_warning': (int, 1, 255),
+    'normalized_headroom_fraction': (float, 0.0, 0.5),
+    'wear_warning': (float, 0.5, 1.0),
+    'nvme_spare_headroom': (int, 0, 50),
+    'nvme_used_warning': (int, 50, 255),
     'scsi_defect_growth': (int, 1, None),
     'scsi_error_growth': (int, 1, None),
 }
@@ -295,11 +316,40 @@ def _load_counter(where: str, doc: Any) -> Tuple[Optional[int], Optional[int]]:
     return absolute, growth
 
 
-def _load_ata(where: str, doc: Any) -> Dict[int, AtaRule]:
+def _load_disabled(at: str, entry: Dict[str, Any], allow: bool,
+                   extra: Sequence[str] = ()) -> bool:
+    """True if this rule entry turns a rule off."""
+    disabled = entry.get('disabled', False)
+    _require(isinstance(disabled, bool), '%s/disabled must be true or false' % at)
+    if not disabled:
+        return False
+    _require(allow, '%s/disabled is only allowed in a profile, which says '
+                    'which devices it applies to' % at)
+    _known_keys(at, entry, ('name', 'disabled') + tuple(extra))
+    name = entry.get('name', '')
+    _require(isinstance(name, str), '%s/name must be a string' % at)
+    return True
+
+
+def _require_threshold(at: str, absolute: Optional[int],
+                       growth: Optional[int], old: Any) -> None:
+    # a rule without thresholds treats the raw value as a level; replacing a
+    # counter rule that way would silently stop judging the counter
+    _require(absolute is not None or growth is not None or old is None
+             or (old.absolute is None and old.growth is None),
+             '%s has neither absolute nor growth, which would stop judging '
+             'the counter "%s"; to turn a rule off, set "disabled": true in '
+             'a profile' % (at, old.name if old else ''))
+
+
+def _load_ata(where: str, doc: Any, base: Mapping[int, AtaRule],
+              allow_disable: bool
+              ) -> Tuple[Dict[int, AtaRule], Dict[int, str]]:
     if doc is None:
-        return {}
+        return {}, {}
     _require(isinstance(doc, dict), '%s must be an object' % where)
     out: Dict[int, AtaRule] = {}
+    disabled: Dict[int, str] = {}
     for key, entry in doc.items():
         try:
             aid = int(key)
@@ -309,32 +359,44 @@ def _load_ata(where: str, doc: Any) -> Dict[int, AtaRule]:
         _require(0 <= aid <= 255,
                  '%s/%s is not a SMART attribute id' % (where, key))
         at = '%s/%s' % (where, key)
-        _known_keys(at, entry, ('name', 'absolute', 'growth'))
+        _known_keys(at, entry, ('name', 'absolute', 'growth', 'disabled'))
+        if _load_disabled(at, entry, allow_disable):
+            disabled[aid] = entry.get('name', '')
+            continue
         name = entry.get('name')
         _require(isinstance(name, str) and name != '',
                  '%s/name must be a non-empty string' % at)
         absolute, growth = _load_counter(at, entry)
+        _require_threshold(at, absolute, growth, base.get(aid))
         out[aid] = AtaRule(name, absolute, growth)
-    return out
+    return out, disabled
 
 
-def _load_device_statistics(where: str, doc: Any) -> Tuple[DevStat, ...]:
+def _load_device_statistics(
+        where: str, doc: Any, base: Sequence[DevStat], allow_disable: bool
+) -> Tuple[Tuple[DevStat, ...], Dict[Tuple[int, int], str]]:
     if doc is None:
-        return ()
+        return (), {}
     _require(isinstance(doc, list), '%s must be an array' % where)
+    known = {(d.page, d.offset): d for d in base}
     out = []
+    disabled: Dict[Tuple[int, int], str] = {}
     for i, entry in enumerate(doc):
         at = '%s[%d]' % (where, i)
         _known_keys(at, entry, ('name', 'page', 'offset', 'absolute',
-                                'growth', 'supersedes'))
-        name = entry.get('name')
-        _require(isinstance(name, str) and name != '',
-                 '%s/name must be a non-empty string' % at)
+                                'growth', 'supersedes', 'disabled'))
         for field in ('page', 'offset'):
             value = entry.get(field)
             _require(isinstance(value, int) and not isinstance(value, bool)
                      and value >= 0,
                      '%s/%s must be a non-negative integer' % (at, field))
+        key = (entry['page'], entry['offset'])
+        if _load_disabled(at, entry, allow_disable, ('page', 'offset')):
+            disabled[key] = entry.get('name', '')
+            continue
+        name = entry.get('name')
+        _require(isinstance(name, str) and name != '',
+                 '%s/name must be a non-empty string' % at)
         supersedes = entry.get('supersedes')
         _require(supersedes is None
                  or (isinstance(supersedes, int)
@@ -342,9 +404,10 @@ def _load_device_statistics(where: str, doc: Any) -> Tuple[DevStat, ...]:
                      and 0 <= supersedes <= 255),
                  '%s/supersedes must be a SMART attribute id or null' % at)
         absolute, growth = _load_counter(at, entry)
+        _require_threshold(at, absolute, growth, known.get(key))
         out.append(DevStat(name, entry['page'], entry['offset'],
                            absolute, growth, supersedes))
-    return tuple(out)
+    return tuple(out), disabled
 
 
 def _load_findings(where: str, doc: Any) -> Tuple[Tuple[str, str], ...]:
@@ -384,10 +447,11 @@ def load_ruleset(doc: Any) -> Ruleset:
              'ruleset must be a non-empty string naming this ruleset')
 
     ata = dict(BUILTIN_RULES.ata)
-    ata.update(_load_ata('ata', doc.get('ata')))
+    ata.update(_load_ata('ata', doc.get('ata'), BUILTIN_RULES.ata, False)[0])
     stats = {(d.page, d.offset): d for d in BUILTIN_RULES.device_statistics}
-    for stat in _load_device_statistics('device_statistics',
-                                        doc.get('device_statistics')):
+    for stat in _load_device_statistics(
+            'device_statistics', doc.get('device_statistics'),
+            BUILTIN_RULES.device_statistics, False)[0]:
         stats[(stat.page, stat.offset)] = stat
     base = BUILTIN_RULES._replace(
         ata=ata,
@@ -411,15 +475,21 @@ def load_ruleset(doc: Any) -> Ruleset:
         for field, pattern in match.items():
             _require(isinstance(pattern, str) and pattern != '',
                      '%s/match/%s must be a non-empty pattern' % (at, field))
+        p_ata, p_ata_off = _load_ata('%s/ata' % at, entry.get('ata'),
+                                     base.ata, True)
+        p_stats, p_stats_off = _load_device_statistics(
+            '%s/device_statistics' % at, entry.get('device_statistics'),
+            base.device_statistics, True)
         profiles.append(Profile(
             name=pname,
             match=dict(match),
-            ata=_load_ata('%s/ata' % at, entry.get('ata')),
-            device_statistics=_load_device_statistics(
-                '%s/device_statistics' % at, entry.get('device_statistics')),
+            ata=p_ata,
+            device_statistics=p_stats,
             findings=_load_findings('%s/findings' % at,
                                     entry.get('findings')),
-            scalars=_load_scalars('%s/defaults' % at, entry.get('defaults'))))
+            scalars=_load_scalars('%s/defaults' % at, entry.get('defaults')),
+            disabled_ata=p_ata_off,
+            disabled_stats=p_stats_off))
 
     return Ruleset(name=name, base=base, profiles=tuple(profiles))
 
@@ -445,9 +515,16 @@ def dump_ruleset(ruleset: Ruleset) -> Dict[str, Any]:
                       'defaults': dict(p.scalars),
                       'findings': [{'status': st, 'reason': why}
                                    for st, why in p.findings],
-                      'ata': {str(aid): dict(name=rule.name, **counters(rule))
-                              for aid, rule in sorted(p.ata.items())},
-                      'device_statistics': stats(p.device_statistics)}
+                      'ata': dict(
+                          [(str(aid), dict(name=rule.name, **counters(rule)))
+                           for aid, rule in sorted(p.ata.items())]
+                          + [(str(aid), {'name': name, 'disabled': True})
+                             for aid, name in sorted(p.disabled_ata.items())]),
+                      'device_statistics': stats(p.device_statistics)
+                      + [{'name': name, 'page': page, 'offset': offset,
+                          'disabled': True}
+                         for (page, offset), name
+                         in sorted(p.disabled_stats.items())]}
                      for p in ruleset.profiles],
     }
 
@@ -830,7 +907,7 @@ def predict(samples: Sequence[Dict[str, Any]],
         status = max((f[0] for f in findings), key=lambda s: _SEVERITY[s])
         findings.sort(key=lambda f: _SEVERITY[f[0]], reverse=True)
         return Prediction(status, [reason for _, reason in findings],
-                          ruleset.name, tuple(applied))
+                          ruleset.name, tuple(applied), rules.disabled)
 
     parsed = [s for s in (parse_sample(sample) for sample in samples)
               if s.has_data]
@@ -859,5 +936,6 @@ def predict(samples: Sequence[Dict[str, Any]],
     findings += _check_scsi(newest, oldest, rules)
 
     if not findings:
-        return Prediction(GOOD, [], ruleset.name, tuple(applied))
+        return Prediction(GOOD, [], ruleset.name, tuple(applied),
+                          rules.disabled)
     return verdict(findings)
