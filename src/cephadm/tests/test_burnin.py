@@ -1,5 +1,6 @@
 import json
 import os
+import textwrap
 import queue
 import threading
 import time
@@ -28,6 +29,18 @@ def _drain(q):
 def _plain_open(path, write):
     # tmpfs and macOS do not support O_DIRECT
     return os.open(path, os.O_RDWR if write else os.O_RDONLY)
+
+
+@pytest.fixture(autouse=True)
+def no_host_tools(monkeypatch):
+    # results must not depend on what the test machine has installed
+    real = burnin.find_executable
+    monkeypatch.setattr(
+        burnin, 'find_executable',
+        lambda name: None if name in ('stress-ng', 'journalctl') else real(name))
+    monkeypatch.setattr(burnin.host_hw, 'smartctl', lambda ctx, dev: None)
+    monkeypatch.setattr(burnin.host_hw, 'ipmi_sel', lambda ctx: None)
+    monkeypatch.setattr(burnin.host_hw, 'physical_nics', lambda: [])
 
 
 @pytest.fixture
@@ -226,6 +239,7 @@ class TestRun:
         monkeypatch.setattr(burnin, 'kernel_errors', lambda ctx, since: [])
         monkeypatch.setattr(
             burnin, 'counters_available', lambda: {'edac': edac, 'throttle': throttle})
+        monkeypatch.setattr(burnin.host_hw, 'ipmi_sel', lambda ctx: [])
         cfg = burnin.BurninConfig(1, True, False, 10, [], False, workers=1)
         status = burnin.run_burnin(None, cfg, 'n')
         assert len(status['notes']) == nnotes
@@ -417,3 +431,116 @@ class TestDiskBench:
         status = burnin.run_burnin(None, cfg, 'r')
         assert status['workers']['disk.d.seq']['start_offset'] == 0
         assert 'disk.d.bench' not in status['workers']
+
+
+class TestGuard:
+    def test_ceph_processes(self, fs):
+        for pid, comm in ((10, 'ceph-osd'), (11, 'python3'), (12, 'radosgw'),
+                          (13, 'cephadm'), (14, 'ceph-crash'), (15, 'bash')):
+            fs.create_file('/proc/%d/comm' % pid, contents=comm + '\n')
+        assert burnin.ceph_processes() == ['ceph-crash[14]', 'ceph-osd[10]', 'radosgw[12]']
+        with pytest.raises(Error, match='runs Ceph processes: ceph-crash'):
+            burnin.check_no_ceph_processes()
+
+    def test_command_refuses(self):
+        ctx = _cephadm.cephadm_init_ctx(['burnin', 'run', '--cpu', '--duration', '1'])
+        with mock.patch.object(burnin, 'ceph_processes', return_value=['ceph-osd[1]']):
+            with pytest.raises(Error, match='ceph-osd'):
+                _cephadm.command_burnin(ctx)
+        # status and stop still work
+        ctx = _cephadm.cephadm_init_ctx(['burnin', 'stop'])
+        with mock.patch.object(burnin, 'ceph_processes', return_value=['ceph-osd[1]']), \
+                mock.patch.object(burnin, 'stop_detached', return_value=False):
+            assert _cephadm.command_burnin(ctx) == 0
+
+
+class TestHardwareCompare:
+    def test_compare(self):
+        before = {
+            'sel': ['1 | a | Temperature | Upper Critical going high'],
+            'smart': {'sda': {'reallocated_sectors': 0, 'crc_errors': 3}},
+            'nics': {'eth0': {'rx_crc_errors': 1}},
+        }
+        after = {
+            'sel': before['sel'] + [
+                '2 | b | Memory #0x01 | Correctable ECC | Asserted',
+                '3 | c | Processor | Thermal Trip | Asserted',
+            ],
+            'smart': {'sda': {'reallocated_sectors': 2, 'crc_errors': 5}},
+            'nics': {'eth0': {'rx_crc_errors': 4}},
+        }
+        fails, warns = burnin.compare_hardware(before, after)
+        assert fails == [
+            'BMC event: 2 | b | Memory #0x01 | Correctable ECC | Asserted',
+            'sda: SMART reallocated_sectors +2',
+        ]
+        assert warns == [
+            'BMC thermal event: 3 | c | Processor | Thermal Trip | Asserted',
+            'sda: SMART crc_errors +2',
+            'eth0: rx_crc_errors +3',
+        ]
+
+    def test_no_bmc(self):
+        assert burnin.compare_hardware({'sel': None}, {'sel': None}) == ([], [])
+
+
+class TestStressNg:
+    def _fake(self, tmp_path, script):
+        exe = tmp_path / 'stress-ng'
+        exe.write_text('#!/bin/sh\n' + script)
+        exe.chmod(0o755)
+        return str(exe)
+
+    def _run(self, tmp_path, monkeypatch, script, stop=None):
+        exe = self._fake(tmp_path, script)
+        monkeypatch.setattr(burnin, 'STATUS_FILE', str(tmp_path / 'status.json'))
+        monkeypatch.setattr(burnin, 'find_executable', lambda n: exe)
+        q = queue.Queue()
+        burnin.stressng_worker(stop or threading.Event(), q, 'stress-ng',
+                               time.monotonic() + 5, 2, 1, 10)
+        return _drain(q)
+
+    def test_passes(self, tmp_path, monkeypatch):
+        # real stress-ng 0.19.03 output
+        st = self._run(tmp_path, monkeypatch, textwrap.dedent("""\
+            cat <<'EOF'
+            stress-ng: info:  [8853] dispatching hogs: 2 cpu, 2 vm
+            stress-ng: metrc: [8853] stressor       bogo ops real time  usr time  sys time   bogo ops/s     bogo ops/s
+            stress-ng: metrc: [8853]                           (secs)    (secs)    (secs)   (real time) (usr+sys time)
+            stress-ng: metrc: [8853] cpu                6164      4.00      3.99      0.00      1541.21        1542.22
+            stress-ng: metrc: [8853] vm               531058      4.00      3.54      0.49    132617.43      132014.79
+            stress-ng: info:  [8853] skipped: 0
+            stress-ng: info:  [8853] passed: 4: cpu (2) vm (2)
+            stress-ng: info:  [8853] failed: 0
+            stress-ng: info:  [8853] successful run completed in 4.03 secs
+            EOF
+            """))
+        assert st['errors'] == 0 and st['exit_code'] == 0
+        assert '--cpu 2 --cpu-method all' in st['command']
+        assert '--vm 1 --vm-bytes 10% --vm-method all' in st['command']
+        assert '--yaml' not in st['command']
+        assert st['metrics'] == [
+            {'stressor': 'cpu', 'bogo_ops': 6164, 'bogo_ops_per_sec': 1541.21},
+            {'stressor': 'vm', 'bogo_ops': 531058, 'bogo_ops_per_sec': 132617.43},
+        ]
+        text = burnin.format_status({'state': 'passed', 'workers': {'stress-ng': st}})
+        assert 'cpu 1541.21 bogo ops/s, vm 132617.43 bogo ops/s' in text
+
+    def test_failed_count(self, tmp_path, monkeypatch):
+        st = self._run(tmp_path, monkeypatch,
+                       'echo "stress-ng: info:  [1] failed: 2: vm (2)"\n')
+        assert st['error_msgs'] == ['stress-ng: 2 stressor instance(s) failed']
+
+    def test_verify_failure(self, tmp_path, monkeypatch):
+        st = self._run(tmp_path, monkeypatch,
+                       'echo "stress-ng: fail:  [2] vm: detected memory error"\nexit 2\n')
+        assert st['errors'] >= 1
+        assert 'detected memory error' in st['error_msgs'][0]
+
+    def test_stop(self, tmp_path, monkeypatch):
+        stop = threading.Event()
+        threading.Timer(0.5, stop.set).start()
+        t = time.monotonic()
+        st = self._run(tmp_path, monkeypatch, 'trap "exit 0" INT\nsleep 30 & wait\n', stop)
+        assert time.monotonic() - t < 10
+        assert st['errors'] == 0

@@ -4882,6 +4882,9 @@ def command_burnin(ctx: CephadmContext) -> int:
             logger.info('No burn-in is running')
         return 0
 
+    # start or run. A burn-in would starve the daemons, and a destructive
+    # one could hit their disks, so never run one next to Ceph.
+    burnin.check_no_ceph_processes()
     # start or run: with no explicit selection, test everything that is
     # safe to test
     cpu, memory = ctx.cpu, ctx.memory
@@ -4911,6 +4914,7 @@ def command_burnin(ctx: CephadmContext) -> int:
         workers=ctx.workers,
         disk_bench_seconds=ctx.disk_bench_seconds,
         resume=not ctx.from_start,
+        engine=ctx.engine,
     )
     run_id = ctx.run_id or datetime.datetime.now(
         datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
@@ -4929,6 +4933,7 @@ def command_burnin(ctx: CephadmContext) -> int:
         '--memory-percent', str(cfg.memory_percent),
         '--workers', str(cfg.workers),
         '--disk-bench-seconds', str(cfg.disk_bench_seconds),
+        '--engine', cfg.engine,
     ]
     if not cfg.resume:
         run_args.append('--from-start')
@@ -6310,6 +6315,12 @@ def _get_parser():
         default=burnin.DISK_BENCH_SECONDS,
         help='before the stress phase, benchmark each disk with sequential '
         'and then random reads for this many seconds each (0 to skip)')
+    parser_burnin.add_argument(
+        '--engine',
+        choices=burnin.ENGINES,
+        default='auto',
+        help='CPU and memory stress: stress-ng (verifying its results), the '
+        'builtin python workers, or stress-ng when installed (auto)')
     parser_burnin.add_argument(
         '--from-start',
         action='store_true',

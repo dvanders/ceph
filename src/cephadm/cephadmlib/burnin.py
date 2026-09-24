@@ -45,6 +45,7 @@ import random
 import re
 import signal
 import struct
+import subprocess
 import sys
 import time
 import zlib
@@ -59,6 +60,7 @@ from .context import CephadmContext
 from .exceptions import Error
 from .exe_utils import find_executable
 from .file_utils import read_file, write_new
+from . import host_hw
 from .host_tuning import (
     data_devices,
     device_info,
@@ -95,6 +97,8 @@ BLOCK_MAGIC = b'CEPHBURN'
 BLOCK_HEADER = struct.Struct('<8sQQ')  # magic, offset, run seed
 
 STATS_INTERVAL = 5.0
+# CPU and memory stress: stress-ng when installed, else the builtin workers
+ENGINES = ('auto', 'stress-ng', 'builtin')
 LATENCY_SAMPLES = 10000
 # per-disk benchmark before the stress phase: seconds per pattern
 DISK_BENCH_SECONDS = 30
@@ -185,6 +189,99 @@ def _cpu_kernel(seed: int) -> Tuple[str, int, float]:
     for i in range(1, 20000):
         acc += math.sin(i * 0.001) * math.sqrt(i) / (1.0 + math.log(i))
     return digest, crc, acc
+
+
+def stressng_worker(
+    stop: Any,
+    queue: Any,
+    name: str,
+    deadline: float,
+    cpu_workers: int,
+    mem_workers: int,
+    mem_percent: int,
+) -> None:
+    """CPU and memory stress with stress-ng, verifying every result."""
+    rep = _Reporter(queue, name, 'stress-ng', 'cpu+memory')
+    timeout = int(deadline - time.monotonic())
+    if timeout <= 0 or stop.is_set():
+        rep.finish()
+        return
+    outdir = os.path.dirname(STATUS_FILE)
+    os.makedirs(outdir, mode=0o700, exist_ok=True)
+    log_path = os.path.join(outdir, 'stress-ng.log')
+    # the metrics come from the log: --yaml output is not valid YAML in
+    # some stress-ng versions (0.19.03 misindents build-info)
+    cmd = [
+        find_executable('stress-ng') or 'stress-ng',
+        '--timeout',
+        '%ds' % timeout,
+        '--verify',
+        '--metrics-brief',
+    ]
+    if cpu_workers:
+        cmd += ['--cpu', str(cpu_workers), '--cpu-method', 'all']
+    if mem_workers:
+        cmd += [
+            '--vm',
+            str(mem_workers),
+            '--vm-bytes',
+            '%d%%' % mem_percent,
+            '--vm-method',
+            'all',
+        ]
+    rep.stats['command'] = ' '.join(cmd)
+    with open(log_path, 'w') as log:
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+        stopped = False
+        while proc.poll() is None:
+            if stop.wait(1.0) and not stopped:
+                # stress-ng stops its stressors and reports on SIGINT
+                proc.send_signal(signal.SIGINT)
+                stopped = True
+            rep.maybe_report()
+        try:
+            proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    rep.stats['exit_code'] = proc.returncode
+    with open(log_path) as log:
+        lines = log.read().splitlines()
+    for line in lines:
+        if re.search(r'\bfail\b|verif.*(fail|error)|error:', line, re.I):
+            rep.error(line.strip())
+    # 0: ok; 2: a stressor failed or a verification did not match
+    if proc.returncode not in (0,) and not (stopped and proc.returncode < 0):
+        if not rep.stats['errors'] or proc.returncode == 2:
+            rep.error('stress-ng exited with code %d' % proc.returncode)
+    rep.stats['metrics'] = stressng_metrics(lines)
+    m = re.search(r'\bfailed: (\d+)', '\n'.join(lines))
+    if m and int(m.group(1)) and not rep.stats['errors']:
+        rep.error('stress-ng: %s stressor instance(s) failed' % m.group(1))
+    rep.stats['log_tail'] = lines[-20:]
+    rep.finish()
+
+
+STRESSNG_METRIC = re.compile(
+    r'metrc: \[\d+\]\s+(?P<stressor>[a-z][\w-]*)\s+(?P<ops>\d+)\s+'
+    r'(?P<secs>[\d.]+)\s+[\d.]+\s+[\d.]+\s+(?P<rate>[\d.]+)'
+)
+
+
+def stressng_metrics(lines: List[str]) -> List[Dict[str, Any]]:
+    """Per-stressor bogo ops from stress-ng --metrics-brief output."""
+    out = []
+    for line in lines:
+        m = STRESSNG_METRIC.search(line)
+        if m:
+            out.append(
+                {
+                    'stressor': m.group('stressor'),
+                    'bogo_ops': int(m.group('ops')),
+                    'bogo_ops_per_sec': float(m.group('rate')),
+                }
+            )
+    return out
 
 
 def cpu_worker(stop: Any, queue: Any, name: str, deadline: float) -> None:
@@ -779,6 +876,100 @@ def prune_runs(keep: int = MAX_RUNS_KEPT) -> None:
 # runner
 
 
+##################################
+# guard and hardware snapshots
+
+# daemons and clients that must not share a host with a burn-in
+CEPH_PROCESSES = ('radosgw', 'rbd-mirror', 'rbd-nbd', 'ganesha.nfsd')
+
+
+def ceph_processes() -> List[str]:
+    """'name[pid]' of every Ceph process on the host, containerized or not."""
+    out = []
+    me = {os.getpid(), os.getppid()}
+    for comm_path in glob('/proc/[0-9]*/comm'):
+        pid = int(comm_path.split('/')[2])
+        if pid in me:
+            continue
+        try:
+            with open(comm_path) as f:
+                comm = f.read().strip()
+        except OSError:
+            continue
+        if comm.startswith('ceph-') or comm in CEPH_PROCESSES:
+            out.append('%s[%d]' % (comm, pid))
+    return sorted(out)
+
+
+def check_no_ceph_processes() -> None:
+    procs = ceph_processes()
+    if procs:
+        raise Error(
+            'refusing to burn in a host that runs Ceph processes: %s'
+            % ', '.join(procs[:10])
+            + (' and %d more' % (len(procs) - 10) if len(procs) > 10 else '')
+        )
+
+
+def hardware_snapshot(
+    ctx: CephadmContext, devices: List[str]
+) -> Dict[str, Any]:
+    snap: Dict[str, Any] = {
+        'sel': host_hw.ipmi_sel(ctx),
+        'nics': {i: host_hw.nic_counters(i) for i in host_hw.physical_nics()},
+        'smart': {},
+    }
+    for path in devices:
+        dev = os.path.basename(path)
+        data = host_hw.smartctl(ctx, dev)
+        if data is not None:
+            snap['smart'][dev] = host_hw.smart_counters(data)
+    return snap
+
+
+SMART_FAILURE_COUNTERS = (
+    'reallocated_sectors',
+    'pending_sectors',
+    'offline_uncorrectable',
+    'reported_uncorrect',
+    'media_errors',
+    'grown_defects',
+)
+
+
+def compare_hardware(
+    before: Dict[str, Any], after: Dict[str, Any]
+) -> Tuple[List[str], List[str]]:
+    """(failures, warnings) from what changed during the burn-in."""
+    failures: List[str] = []
+    warnings: List[str] = []
+    if before.get('sel') is not None and after.get('sel') is not None:
+        seen = set(before['sel'])
+        new = [e for e in after['sel'] if e not in seen]
+        kinds = host_hw.classify_sel(new)
+        for e in kinds['error']:
+            failures.append('BMC event: ' + e)
+        for e in kinds['thermal']:
+            warnings.append('BMC thermal event: ' + e)
+    for dev, a in sorted(after.get('smart', {}).items()):
+        b = before.get('smart', {}).get(dev, {})
+        for k, v in sorted(a.items()):
+            delta = v - b.get(k, v)
+            if delta <= 0:
+                continue
+            msg = '%s: SMART %s +%d' % (dev, k, delta)
+            (failures if k in SMART_FAILURE_COUNTERS else warnings).append(
+                msg
+            )
+    for iface, a in sorted(after.get('nics', {}).items()):
+        b = before.get('nics', {}).get(iface, {})
+        for k in host_hw.NIC_ERROR_COUNTERS:
+            delta = a.get(k, 0) - b.get(k, a.get(k, 0))
+            if delta > 0:
+                warnings.append('%s: %s +%d' % (iface, k, delta))
+    return failures, warnings
+
+
 class BurninConfig:
     def __init__(
         self,
@@ -791,6 +982,7 @@ class BurninConfig:
         workers: int = 0,
         disk_bench_seconds: int = DISK_BENCH_SECONDS,
         resume: bool = True,
+        engine: str = 'auto',
     ):
         self.duration = duration
         self.cpu = cpu
@@ -801,6 +993,9 @@ class BurninConfig:
         self.workers = workers or os.cpu_count() or 1
         self.disk_bench_seconds = disk_bench_seconds
         self.resume = resume
+        if engine not in ENGINES:
+            raise Error('unknown burn-in engine %r' % engine)
+        self.engine = engine
 
     def to_json(self) -> Dict[str, Any]:
         return dict(self.__dict__)
@@ -927,6 +1122,7 @@ def run_burnin(
         'counters_before': host_counters(),
         'counters_available': counters_available(),
     }
+    hw_before = hardware_snapshot(ctx, cfg.devices)
 
     procs: List[Any] = []
     t0 = time.monotonic()
@@ -976,16 +1172,33 @@ def run_burnin(
         spawn(
             'disk.%s.rand' % dev, disk_rand_worker, path, start_at=stress_at
         )
-    if cfg.cpu:
-        for i in range(cfg.workers):
-            spawn('cpu.%d' % i, cpu_worker, start_at=stress_at)
-    if cfg.memory:
-        total = _mem_available() * cfg.memory_percent // 100
-        n = min(cfg.workers, 16)
-        for i in range(n):
-            spawn(
-                'memory.%d' % i, memory_worker, total // n, start_at=stress_at
-            )
+    engine = cfg.engine
+    if engine == 'auto':
+        engine = 'stress-ng' if find_executable('stress-ng') else 'builtin'
+    status['engine'] = engine
+    if engine == 'stress-ng' and (cfg.cpu or cfg.memory):
+        spawn(
+            'stress-ng',
+            stressng_worker,
+            cfg.workers if cfg.cpu else 0,
+            min(cfg.workers, 16) if cfg.memory else 0,
+            cfg.memory_percent,
+            start_at=stress_at,
+        )
+    else:
+        if cfg.cpu:
+            for i in range(cfg.workers):
+                spawn('cpu.%d' % i, cpu_worker, start_at=stress_at)
+        if cfg.memory:
+            total = _mem_available() * cfg.memory_percent // 100
+            n = min(cfg.workers, 16)
+            for i in range(n):
+                spawn(
+                    'memory.%d' % i,
+                    memory_worker,
+                    total // n,
+                    start_at=stress_at,
+                )
 
     def _on_signal(signum: int, frame: Any) -> None:
         logger.info('burn-in: got signal %d, stopping', signum)
@@ -1049,6 +1262,7 @@ def run_burnin(
     status['kernel_errors'] = kerr
 
     failures: List[str] = []
+    notes: List[str] = []
     for w in status['workers'].values():
         if w.get('errors'):
             failures.append('%s: %d errors' % (w['name'], w['errors']))
@@ -1067,7 +1281,16 @@ def run_burnin(
         failures.append('%d hardware errors in the kernel log' % len(kerr))
     models = {d: status['devices'].get(d, {}).get('model', '') for d in bench}
     warnings.extend(find_outliers(bench, models))
-    notes: List[str] = []
+    hw_after = hardware_snapshot(ctx, cfg.devices)
+    hw_fail, hw_warn = compare_hardware(hw_before, hw_after)
+    failures.extend(hw_fail)
+    warnings.extend(hw_warn)
+    status['hardware'] = {'before': hw_before, 'after': hw_after}
+    if hw_before.get('sel') is None:
+        notes.append(
+            'no BMC access (ipmitool or /dev/ipmi0 missing): the BMC event '
+            'log was not checked for errors or thermal events'
+        )
     available = status['counters_available']
     if not available['edac']:
         notes.append(
@@ -1237,6 +1460,11 @@ def format_status(status: Dict[str, Any]) -> str:
                 w.get('passes', 0) + 1,
                 w['pass_progress_pct'],
                 _fmt_secs(eta) if eta is not None else '?',
+            )
+        elif w.get('metrics'):
+            extra = ' (%s)' % ', '.join(
+                '%s %s bogo ops/s' % (m['stressor'], m['bogo_ops_per_sec'])
+                for m in w['metrics']
             )
         elif 'lat_p99_ms' in w:
             extra = ' (p99 %s ms, max %s ms)' % (
