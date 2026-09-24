@@ -166,7 +166,7 @@ from cephadmlib.decorators import (
     require_image
 )
 from cephadmlib.host_facts import HostFacts, list_networks, list_rdma
-from cephadmlib import burnin, net_test
+from cephadmlib import burnin, host_tune, net_test
 from cephadmlib.host_tuning import (
     STATUS_FAIL,
     STATUS_WARN,
@@ -4858,6 +4858,36 @@ def command_net_test(ctx: CephadmContext) -> int:
 ##################################
 
 
+def command_host_tune(ctx: CephadmContext) -> int:
+    """Show, apply or remove the latency and power tuning for Ceph"""
+    if ctx.remove:
+        done = host_tune.remove(ctx)
+    elif ctx.apply:
+        done = host_tune.apply(
+            ctx, ctx.cmdline, ctx.iommu_off, ctx.mitigations_off,
+            packages=not ctx.no_packages, nic_rings=ctx.nic_rings)
+    else:
+        items = host_tune.plan(
+            ctx, ctx.cmdline, ctx.iommu_off, ctx.mitigations_off,
+            packages=not ctx.no_packages, nic_rings=ctx.nic_rings)
+        if ctx.format == 'json':
+            print(json.dumps(items, indent=2, sort_keys=True))
+        else:
+            print(host_tune.format_plan(items))
+            if any(i['change'] or i.get('always') for i in items):
+                print('\nDry run: pass --apply to make these changes.')
+            else:
+                print('\nNothing to change.')
+        return 0
+    if ctx.format == 'json':
+        print(json.dumps(done, indent=2, sort_keys=True))
+    else:
+        print(host_tune.format_done(done))
+    return 0 if all(d['ok'] for d in done) else 1
+
+##################################
+
+
 def command_burnin(ctx: CephadmContext) -> int:
     """Start, run, stop or query a CPU/memory/disk burn-in of this host"""
     action = ctx.burnin_action
@@ -6273,6 +6303,41 @@ def _get_parser():
     parser_net_test.add_argument(
         '--parallel', type=int, default=4, help='iperf3 parallel streams')
 
+    parser_host_tune = subparsers.add_parser(
+        'host-tune',
+        help='show (default), apply or remove what host-precheck reports: '
+        'CPU governor and C-states, PCIe ASPM, NVMe APST, THP, I/O '
+        'schedulers, NIC EEE, sysctls, tuned, irqbalance and missing tools')
+    parser_host_tune.set_defaults(func=command_host_tune)
+    parser_host_tune.add_argument(
+        '--apply', action='store_true',
+        help='apply the tuning now and at every boot')
+    parser_host_tune.add_argument(
+        '--remove', action='store_true',
+        help='remove the boot-time tuning (runtime values stay until reboot)')
+    parser_host_tune.add_argument(
+        '--cmdline', action='store_true',
+        help='also add kernel arguments with grubby (takes effect at the next '
+        'reboot): ' + ' '.join(host_tune.BASE_CMDLINE))
+    parser_host_tune.add_argument(
+        '--iommu-off', action='store_true',
+        help='with --cmdline, add amd_iommu=off (AMD EPYC)')
+    parser_host_tune.add_argument(
+        '--mitigations-off', action='store_true',
+        help='with --cmdline, add mitigations=off (dedicated OSD hosts only, '
+        'not hosts that also run hypervisors or other clients)')
+    parser_host_tune.add_argument(
+        '--no-packages', action='store_true',
+        help='do not install missing tools (smartmontools, nvme-cli, ethtool, '
+        'tuned, irqbalance, ipmitool, stress-ng, iperf3)')
+    parser_host_tune.add_argument(
+        '--nic-rings', action='store_true',
+        help='also grow NIC RX/TX rings to their maximum; this briefly resets '
+        'the link on many drivers')
+    parser_host_tune.add_argument(
+        '--format', choices=['plain', 'json'], default='plain',
+        help='output format')
+
     parser_burnin = subparsers.add_parser(
         'burnin', help='stress test CPU, memory and disks of this host')
     parser_burnin.set_defaults(func=command_burnin)
@@ -6628,6 +6693,7 @@ def main() -> None:
                     command_host_precheck,
                     command_burnin,
                     command_net_test,
+                    command_host_tune,
                     command_check_online,
                     command_prepare_host,
                     command_setup_ssh_user,
