@@ -166,12 +166,13 @@ from cephadmlib.decorators import (
     require_image
 )
 from cephadmlib.host_facts import HostFacts, list_networks, list_rdma
-from cephadmlib import burnin
+from cephadmlib import burnin, net_test
 from cephadmlib.host_tuning import (
     STATUS_FAIL,
     STATUS_WARN,
     format_report as format_tuning_report,
     run_checks as run_tuning_checks,
+    check_groups as tuning_check_groups,
 )
 from cephadmlib.ssh import authorize_ssh_key, check_ssh_connectivity
 from cephadmlib.daemon_form import (
@@ -4820,7 +4821,8 @@ def command_prepare_host(ctx: CephadmContext) -> None:
 
 def command_host_precheck(ctx: CephadmContext) -> int:
     """Advisory checks of host tuning (sysctls, tuned, disks, network...)"""
-    report = run_tuning_checks(ctx, networks=ctx.network, skip=ctx.skip)
+    report = run_tuning_checks(
+        ctx, networks=ctx.network, skip=ctx.skip, peers=ctx.peer)
     report['hostname'] = get_hostname()
     if ctx.format == 'json':
         print(json.dumps(report, indent=2))
@@ -4830,6 +4832,28 @@ def command_host_precheck(ctx: CephadmContext) -> int:
     if summary[STATUS_FAIL] or (ctx.fail_on_warn and summary[STATUS_WARN]):
         return 1
     return 0
+
+##################################
+
+
+def command_net_test(ctx: CephadmContext) -> int:
+    """Ping or iperf3 tests between this host and its peers"""
+    action = ctx.net_test_action
+    if action == 'ping':
+        result: Any = net_test.ping_peers(ctx, ctx.peer)
+    elif action == 'iperf-server':
+        result = net_test.iperf_server(ctx, ctx.port, ctx.timeout_secs)
+    elif action == 'iperf-stop':
+        result = {'stopped': net_test.iperf_server_stop(ctx, ctx.port)}
+    elif action == 'iperf-client':
+        if len(ctx.peer) != 1:
+            raise Error('iperf-client needs exactly one --peer')
+        result = net_test.iperf_client(
+            ctx, ctx.peer[0], ctx.port, ctx.duration, ctx.parallel)
+    else:
+        raise Error('net-test: unknown action %s' % action)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 1 if isinstance(result, dict) and result.get('error') else 0
 
 ##################################
 
@@ -6203,9 +6227,14 @@ def _get_parser():
         '--skip',
         action='append',
         default=[],
-        choices=['sysctl', 'thp', 'tuned', 'cpu_governor', 'kernel', 'swap',
-                 'disks', 'sizing', 'network'],
+        choices=tuning_check_groups(),
         help='skip a group of checks (may be repeated)')
+    parser_host_precheck.add_argument(
+        '--peer',
+        action='append',
+        default=[],
+        help='[name=]address of another host to ping with small and full-MTU '
+        'packets (may be repeated)')
     parser_host_precheck.add_argument(
         '--fail-on-warn',
         action='store_true',
@@ -6215,6 +6244,29 @@ def _get_parser():
         choices=['plain', 'json'],
         default='plain',
         help='output format')
+
+    parser_net_test = subparsers.add_parser(
+        'net-test', help='ping or iperf3 tests between this host and others')
+    parser_net_test.set_defaults(func=command_net_test)
+    parser_net_test.add_argument(
+        'net_test_action',
+        choices=['ping', 'iperf-server', 'iperf-stop', 'iperf-client'],
+        help='ping: small and full-MTU pings of each --peer; iperf-server: '
+        'start an iperf3 server that stops by itself after --timeout-secs; '
+        'iperf-stop: stop it; iperf-client: bidirectional test against '
+        '--peer')
+    parser_net_test.add_argument(
+        '--peer', action='append', default=[],
+        help='[name=]address of a peer (may be repeated for ping)')
+    parser_net_test.add_argument(
+        '--port', type=int, default=net_test.IPERF_PORT, help='iperf3 port')
+    parser_net_test.add_argument(
+        '--timeout-secs', type=int, default=300,
+        help='how long an iperf3 server stays up')
+    parser_net_test.add_argument(
+        '--duration', type=int, default=10, help='iperf3 test length')
+    parser_net_test.add_argument(
+        '--parallel', type=int, default=4, help='iperf3 parallel streams')
 
     parser_burnin = subparsers.add_parser(
         'burnin', help='stress test CPU, memory and disks of this host')
@@ -6564,6 +6616,7 @@ def main() -> None:
                     command_check_host,
                     command_host_precheck,
                     command_burnin,
+                    command_net_test,
                     command_check_online,
                     command_prepare_host,
                     command_setup_ssh_user,

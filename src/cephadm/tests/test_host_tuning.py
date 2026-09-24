@@ -294,7 +294,7 @@ class TestReport:
             raise RuntimeError('kaboom')
 
         with mock.patch.object(ht, 'CHECKS', [('thp', boom)]):
-            rep = ht.run_checks(None, skip=['network'])
+            rep = ht.run_checks(None, skip=['network', 'firmware'])
         assert rep['checks'] == [
             {
                 'check': 'thp',
@@ -361,3 +361,121 @@ class TestKernel:
         self._host(fs, self.XEON, 'ro mitigations=off',
                    vulns={'spectre_v2': 'Vulnerable'})
         assert _by(ht.check_kernel(None), 'cpu_mitigations')[0]['status'] == ht.STATUS_OK
+
+
+class TestPower:
+    def _cstates(self, fs, states):
+        for i, (name, lat, disabled) in enumerate(states):
+            base = '/sys/devices/system/cpu/cpu0/cpuidle/state%d' % i
+            fs.create_file(base + '/name', contents=name)
+            fs.create_file(base + '/latency', contents=str(lat))
+            fs.create_file(base + '/disable', contents=str(int(disabled)))
+
+    def test_cstates_and_epp(self, fs):
+        fs.create_file('/proc/cmdline', contents='ro')
+        self._cstates(fs, [('POLL', 0, False), ('C1', 2, False),
+                           ('C1E', 10, False), ('C6', 170, False), ('C6S', 290, True)])
+        for c, epp in ((0, 'performance'), (1, 'balance_power')):
+            fs.create_file('/sys/devices/system/cpu/cpu%d/cpufreq/'
+                           'energy_performance_preference' % c, contents=epp)
+        fs.create_file('/sys/module/pcie_aspm/parameters/policy',
+                       contents='default performance [powersave] powersupersave')
+        with mock.patch.object(ht.host_hw, 'physical_nics', return_value=[]):
+            res = {r['check']: r for r in ht.check_power(None)}
+        assert res['cstates']['status'] == ht.STATUS_WARN
+        assert res['cstates']['value'] == 'C6(170us)'
+        assert res['epp']['value'] == 'balance_power,performance'
+        assert res['aspm']['status'] == ht.STATUS_WARN
+
+    def test_all_tuned(self, fs):
+        fs.create_file('/proc/cmdline', contents='ro pcie_aspm=off')
+        self._cstates(fs, [('POLL', 0, False), ('C1', 2, False), ('C6', 170, True)])
+        fs.create_file('/sys/module/pcie_aspm/parameters/policy', contents='[default]')
+        fs.create_file('/sys/class/nvme/nvme0/power/pm_qos_latency_tolerance_us', contents='0')
+        fs.create_file('/sys/module/nvme_core/parameters/default_ps_max_latency_us',
+                       contents='100000')
+        with mock.patch.object(ht.host_hw, 'physical_nics', return_value=[]):
+            res = ht.check_power(None)
+        assert {r['status'] for r in res} == {ht.STATUS_OK}
+
+    def test_apst_and_eee(self, fs):
+        fs.create_file('/proc/cmdline', contents='ro')
+        fs.create_file('/sys/class/nvme/nvme0/power/pm_qos_latency_tolerance_us',
+                       contents='100000')
+        fs.create_file('/sys/module/nvme_core/parameters/default_ps_max_latency_us',
+                       contents='100000')
+        eee = 'EEE settings for eth0:\n\tEEE status: enabled - active\n'
+        with mock.patch.object(ht.host_hw, 'physical_nics', return_value=['eth0']), \
+                mock.patch.object(ht.host_hw, '_run', return_value=(eee, 0)):
+            res = {r['check']: r for r in ht.check_power(None)}
+        assert res['nvme_apst']['target'] == 'nvme0'
+        assert res['eee']['status'] == ht.STATUS_WARN
+
+
+class TestNuma:
+    def test_numa(self, fs):
+        for n in (0, 1, 2, 3):
+            fs.create_dir('/sys/devices/system/node/node%d' % n)
+        fs.create_file('/proc/sys/vm/zone_reclaim_mode', contents='1')
+        fs.create_file('/proc/sys/kernel/numa_balancing', contents='1')
+        fs.create_file('/proc/cpuinfo', contents='model name : AMD EPYC 7713\n'
+                       'physical id : 0\nphysical id : 1\n')
+        res = ht.check_numa(None)
+        assert [(r['status'], r['target']) for r in res] == [
+            (ht.STATUS_WARN, 'vm.zone_reclaim_mode'),
+            (ht.STATUS_INFO, 'kernel.numa_balancing'),
+            (ht.STATUS_INFO, ''),
+        ]
+        assert res[2]['message'] == '4 NUMA nodes on 2 sockets (AMD NPS2)'
+
+    def test_single_node(self, fs):
+        fs.create_dir('/sys/devices/system/node/node0')
+        assert ht.check_numa(None) == []
+
+
+class TestNicTuning:
+    def test_nic_tuning(self, fs):
+        base = '/sys/class/net/eth0'
+        fs.create_dir(base + '/device')
+        fs.create_file(base + '/operstate', contents='up')
+        fs.create_dir(base + '/queues/rx-0')
+        fs.create_dir(base + '/queues/rx-1')
+        rings = ('Ring parameters for eth0:\nPre-set maximums:\nRX:\t\t8192\nTX:\t\t8192\n'
+                 'Current hardware settings:\nRX:\t\t1024\nTX:\t\t1024\n')
+        feats = ('tcp-segmentation-offload: on\ngeneric-segmentation-offload: on\n'
+                 'generic-receive-offload: off\n')
+
+        def run(ctx, cmd, **kw):
+            return {'systemctl': ('inactive\n', 3), '-g': (rings, 0),
+                    '-k': (feats, 0)}[cmd[0] if cmd[0] == 'systemctl' else cmd[1]]
+
+        with mock.patch.object(ht.host_hw, '_run', side_effect=run):
+            res = {r['check']: r for r in ht.check_nic_tuning(None)}
+        assert res['irqbalance']['value'] == 'inactive'
+        assert (res['nic_rings']['value'], res['nic_rings']['expected']) == (1024, 8192)
+        assert res['nic_offloads']['value'] == 'generic-receive-offload'
+
+
+class TestPeers:
+    def _ping(self, results):
+        def fake(ctx, addr, size):
+            return results[size is not None]
+        return fake
+
+    @pytest.mark.parametrize('small, big, status, text', [
+        ({'ok': True, 'loss_pct': 0, 'rtt_avg_ms': 0.2}, {'ok': True, 'loss_pct': 0},
+         'ok', 'reachable at MTU 9000'),
+        ({'ok': True, 'loss_pct': 0}, {'ok': False, 'loss_pct': 100}, 'fail', 'jumbo frames'),
+        ({'ok': False, 'loss_pct': 100}, {'ok': False, 'loss_pct': 100}, 'fail', 'unreachable'),
+        ({'ok': True, 'loss_pct': 33.3}, {'ok': True, 'loss_pct': 0}, 'warn', 'packet loss'),
+    ])
+    def test_ping(self, small, big, status, text):
+        from cephadmlib import net_test
+        with mock.patch.object(net_test, 'find_executable', return_value='x'), \
+                mock.patch.object(net_test, 'route_iface', return_value='bond0'), \
+                mock.patch.object(net_test, 'iface_mtu', return_value=9000), \
+                mock.patch.object(net_test, '_ping', side_effect=self._ping({False: small, True: big})):
+            r = ht.check_peers(None, ['host2=10.0.0.2'])[0]
+        assert r['status'] == status
+        assert r['target'] == 'host2 (10.0.0.2)'
+        assert text in r['message']

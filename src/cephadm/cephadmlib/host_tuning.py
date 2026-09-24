@@ -26,6 +26,7 @@ from .call_wrappers import call, CallVerbosity
 from .context import CephadmContext
 from .exe_utils import find_executable
 from .file_utils import read_file
+from . import host_hw
 
 logger = logging.getLogger()
 
@@ -175,6 +176,9 @@ SYS_BLOCK = '/sys/block'
 SYS_NET = '/sys/class/net'
 SYS_CPU = '/sys/devices/system/cpu'
 SYS_IOMMU = '/sys/class/iommu'
+SYS_NODE = '/sys/devices/system/node'
+# idle states that take longer than this to exit add latency to every I/O
+CSTATE_MAX_LATENCY_US = 10
 THP_PATH = '/sys/kernel/mm/transparent_hugepage/enabled'
 
 
@@ -891,47 +895,615 @@ def check_kernel(ctx: CephadmContext) -> List[Dict[str, Any]]:
     return results
 
 
+def check_smart(ctx: CephadmContext) -> List[Dict[str, Any]]:
+    results = []
+    devs = list_block_devices()
+    if not host_hw.find_executable('smartctl'):
+        return [
+            _result(
+                'smart',
+                STATUS_INFO,
+                'smartctl is not installed (smartmontools); disk health '
+                'was not checked',
+            )
+        ]
+    for dev in devs:
+        data = host_hw.smartctl(ctx, dev)
+        if data is None:
+            continue
+        if not data.get('smart_status') and '_error' not in data:
+            # virtual disks and some RAID volumes have no SMART
+            results.append(
+                _result('smart', STATUS_INFO, 'no SMART data', dev)
+            )
+            continue
+        problems = host_hw.smart_problems(data)
+        if not problems:
+            temp = data.get('temperature', {}).get('current')
+            results.append(
+                _result(
+                    'smart',
+                    STATUS_OK,
+                    '%s firmware %s'
+                    % (
+                        data.get('model_name', ''),
+                        data.get('firmware_version', ''),
+                    ),
+                    dev,
+                    '%s C' % temp if temp is not None else None,
+                )
+            )
+        for sev, msg in problems:
+            results.append(
+                _result(
+                    'smart',
+                    {'fail': STATUS_FAIL, 'warn': STATUS_WARN}.get(
+                        sev, STATUS_INFO
+                    ),
+                    msg,
+                    dev,
+                )
+            )
+    return results
+
+
+def check_pcie(ctx: CephadmContext) -> List[Dict[str, Any]]:
+    results = []
+    for link in host_hw.pci_links():
+        narrow = link['cur_width'] < link['max_width']
+        slow = link['cur_speed'] < link['max_speed']
+        value = 'x%d %.1f GT/s' % (link['cur_width'], link['cur_speed'])
+        expected = 'x%d %.1f GT/s' % (link['max_width'], link['max_speed'])
+        if not (narrow or slow):
+            results.append(
+                _result('pcie', STATUS_OK, 'full link', link['label'], value)
+            )
+            continue
+        limited = (
+            narrow and 0 < link['upstream_width'] <= link['cur_width']
+        ) or (slow and 0 < link['upstream_speed'] <= link['cur_speed'])
+        msg = (
+            'link is limited by the slot or upstream port'
+            if limited
+            else 'link trained below its capability: reseat the card, '
+            'check the slot and riser, or check BIOS lane settings'
+        )
+        results.append(
+            _result('pcie', STATUS_WARN, msg, link['label'], value, expected)
+        )
+    return results
+
+
+def firmware_inventory(
+    ctx: CephadmContext,
+) -> Dict[str, List[Dict[str, str]]]:
+    disks = [host_hw.disk_firmware(d) for d in list_block_devices()]
+    nics = []
+    for iface in host_hw.physical_nics():
+        info = host_hw.ethtool_info(ctx, iface) or {}
+        nics.append(
+            {
+                'iface': iface,
+                'id': host_hw.nic_identity(iface),
+                'driver': info.get('driver', ''),
+                'firmware': info.get('firmware-version', ''),
+            }
+        )
+    return {'disks': disks, 'nics': nics}
+
+
+def _mismatches(
+    items: List[Dict[str, str]], key: str, rev: str, name: str
+) -> Dict[str, Dict[str, List[str]]]:
+    groups: Dict[str, Dict[str, List[str]]] = {}
+    for it in items:
+        if not it.get(key) or not it.get(rev):
+            continue
+        groups.setdefault(it[key], {}).setdefault(it[rev], []).append(
+            it[name]
+        )
+    return {k: v for k, v in groups.items() if len(v) > 1}
+
+
+def check_firmware(
+    ctx: CephadmContext, inv: Optional[Dict[str, List[Dict[str, str]]]] = None
+) -> List[Dict[str, Any]]:
+    if inv is None:
+        inv = firmware_inventory(ctx)
+    results = []
+    for model, revs in sorted(
+        _mismatches(inv['disks'], 'model', 'rev', 'dev').items()
+    ):
+        results.append(
+            _result(
+                'firmware',
+                STATUS_WARN,
+                'disks of one model run different firmware',
+                model,
+                '; '.join(
+                    '%s: %s' % (r, ','.join(d))
+                    for r, d in sorted(revs.items())
+                ),
+            )
+        )
+    for ident, revs in sorted(
+        _mismatches(inv['nics'], 'id', 'firmware', 'iface').items()
+    ):
+        results.append(
+            _result(
+                'firmware',
+                STATUS_WARN,
+                'NICs of one model run different firmware',
+                ident,
+                '; '.join(
+                    '%s: %s' % (r, ','.join(d))
+                    for r, d in sorted(revs.items())
+                ),
+            )
+        )
+    if not results:
+        results.append(
+            _result(
+                'firmware', STATUS_OK, 'no firmware mismatches in this host'
+            )
+        )
+    return results
+
+
+def check_nic_errors(ctx: CephadmContext) -> List[Dict[str, Any]]:
+    results = []
+    for iface in host_hw.physical_nics():
+        c = host_hw.nic_counters(iface)
+        bad = {
+            k: v
+            for k, v in c.items()
+            if k in host_hw.NIC_ERROR_COUNTERS and v
+        }
+        if bad:
+            results.append(
+                _result(
+                    'nic_errors',
+                    STATUS_WARN,
+                    'error counters since boot are non-zero; CRC and frame '
+                    'errors usually mean a bad cable, optic or port',
+                    iface,
+                    ','.join('%s=%d' % kv for kv in sorted(bad.items())),
+                )
+            )
+        packets = c.get('rx_packets', 0) + c.get('tx_packets', 0)
+        drops = c.get('rx_dropped', 0) + c.get('tx_dropped', 0)
+        if packets and drops / packets > 0.001:
+            results.append(
+                _result(
+                    'nic_errors',
+                    STATUS_INFO,
+                    'more than 0.1% of packets dropped since boot',
+                    iface,
+                    'rx_dropped=%d,tx_dropped=%d'
+                    % (c.get('rx_dropped', 0), c.get('tx_dropped', 0)),
+                )
+            )
+        stats = host_hw.ethtool_stats(ctx, iface)
+        if stats:
+            crc = any(re.search(r'crc|fcs|symbol', k, re.I) for k in stats)
+            top = sorted(stats.items(), key=lambda kv: -kv[1])[:6]
+            results.append(
+                _result(
+                    'nic_errors',
+                    STATUS_WARN if crc else STATUS_INFO,
+                    'driver error/drop/discard counters since boot',
+                    iface,
+                    ','.join('%s=%d' % kv for kv in top),
+                )
+            )
+    return results
+
+
+def check_ipmi(ctx: CephadmContext) -> List[Dict[str, Any]]:
+    sel = host_hw.ipmi_sel(ctx)
+    if sel is None:
+        return [
+            _result(
+                'ipmi',
+                STATUS_INFO,
+                'no BMC access (ipmitool or /dev/ipmi0 missing); the SEL '
+                'and sensors were not checked',
+            )
+        ]
+    results = []
+    kinds = host_hw.classify_sel(sel)
+    for kind, desc in (
+        ('error', 'hardware errors in the BMC event log (SEL)'),
+        ('thermal', 'thermal or fan events in the BMC event log (SEL)'),
+    ):
+        if kinds[kind]:
+            results.append(
+                _result(
+                    'ipmi',
+                    STATUS_WARN,
+                    '%d %s; newest: %s'
+                    % (len(kinds[kind]), desc, kinds[kind][-1]),
+                )
+            )
+    for s in host_hw.ipmi_sdr(ctx) or []:
+        results.append(
+            _result(
+                'ipmi',
+                STATUS_WARN if s['status'] == 'non-critical' else STATUS_FAIL,
+                'sensor is %s' % s['status'],
+                s['sensor'],
+                s['reading'],
+            )
+        )
+    if not results:
+        results.append(
+            _result(
+                'ipmi',
+                STATUS_OK,
+                'SEL and sensors clean',
+                value='%d SEL entries' % len(sel),
+            )
+        )
+    return results
+
+
+def _nvme_controllers() -> List[str]:
+    return sorted(glob('/sys/class/nvme/nvme*'))
+
+
+def check_power(ctx: CephadmContext) -> List[Dict[str, Any]]:
+    """CPU idle states, EPP, PCIe ASPM, NVMe APST and NIC EEE."""
+    results = []
+    cmdline = _cmdline()
+
+    deep = []
+    for st in sorted(
+        glob(os.path.join(SYS_CPU, 'cpu0', 'cpuidle', 'state*'))
+    ):
+        lat = _read_int(os.path.join(st, 'latency'))
+        if lat is None or lat <= CSTATE_MAX_LATENCY_US:
+            continue
+        if _read_int(os.path.join(st, 'disable')) == 1:
+            continue
+        deep.append('%s(%dus)' % (_read(os.path.join(st, 'name')), lat))
+    if deep:
+        results.append(
+            _result(
+                'cstates',
+                STATUS_WARN,
+                'deep CPU idle states are enabled; waking from them adds '
+                'latency to every I/O',
+                value=','.join(deep),
+                expected='none above %dus' % CSTATE_MAX_LATENCY_US,
+            )
+        )
+    elif glob(os.path.join(SYS_CPU, 'cpu0', 'cpuidle', 'state*')):
+        results.append(
+            _result('cstates', STATUS_OK, 'no deep idle states enabled')
+        )
+
+    epp = {
+        _read(p)
+        for p in glob(
+            os.path.join(
+                SYS_CPU,
+                'cpu[0-9]*',
+                'cpufreq',
+                'energy_performance_preference',
+            )
+        )
+    }
+    epp.discard(None)
+    if epp and epp != {'performance'}:
+        results.append(
+            _result(
+                'epp',
+                STATUS_WARN,
+                'CPU energy/performance preference favours power saving',
+                value=','.join(sorted(str(e) for e in epp)),
+                expected='performance',
+            )
+        )
+
+    policy = _read('/sys/module/pcie_aspm/parameters/policy')
+    if 'pcie_aspm=off' in cmdline:
+        results.append(
+            _result('aspm', STATUS_OK, 'PCIe ASPM off', value='pcie_aspm=off')
+        )
+    elif policy:
+        p = _bracketed(policy)
+        if p == 'performance':
+            status, msg = STATUS_OK, 'PCIe ASPM policy'
+        elif p == 'default':
+            status = STATUS_INFO
+            msg = (
+                'PCIe ASPM follows the firmware; check it is off in the BIOS'
+            )
+        else:
+            status = STATUS_WARN
+            msg = 'PCIe ASPM adds link wake-up latency to NICs and NVMe'
+        results.append(
+            _result(
+                'aspm',
+                status,
+                msg,
+                value=p,
+                expected='performance or pcie_aspm=off',
+            )
+        )
+
+    ctrls = _nvme_controllers()
+    if ctrls:
+        default_ps = _read_int(
+            '/sys/module/nvme_core/parameters/default_ps_max_latency_us'
+        )
+        apst = [
+            os.path.basename(c)
+            for c in ctrls
+            if _read_int(
+                os.path.join(c, 'power', 'pm_qos_latency_tolerance_us')
+            )
+            not in (0, None)
+        ]
+        if default_ps and apst:
+            results.append(
+                _result(
+                    'nvme_apst',
+                    STATUS_INFO,
+                    'NVMe autonomous power state transitions are enabled; '
+                    'some drives stall or drop off the bus on transitions',
+                    ','.join(apst),
+                    'default_ps_max_latency_us=%d' % default_ps,
+                    'nvme_core.default_ps_max_latency_us=0',
+                )
+            )
+
+    for iface in host_hw.physical_nics():
+        r = host_hw._run(ctx, ['ethtool', '--show-eee', iface])
+        if r and not r[1] and re.search(r'EEE status:\s*enabled', r[0]):
+            results.append(
+                _result(
+                    'eee',
+                    STATUS_WARN,
+                    'Energy-Efficient Ethernet adds latency when the link wakes',
+                    iface,
+                    'enabled',
+                    'disabled',
+                )
+            )
+    return results
+
+
+def check_numa(ctx: CephadmContext) -> List[Dict[str, Any]]:
+    nodes = glob(os.path.join(SYS_NODE, 'node[0-9]*'))
+    if len(nodes) < 2:
+        return []
+    results = []
+    zr = _read_int('/proc/sys/vm/zone_reclaim_mode')
+    if zr:
+        results.append(
+            _result(
+                'numa',
+                STATUS_WARN,
+                'zone reclaim stalls allocations instead of using remote memory',
+                'vm.zone_reclaim_mode',
+                zr,
+                0,
+            )
+        )
+    nb = _read_int('/proc/sys/kernel/numa_balancing')
+    if nb:
+        results.append(
+            _result(
+                'numa',
+                STATUS_INFO,
+                'automatic NUMA balancing migrates pages under OSDs and adds '
+                'latency jitter',
+                'kernel.numa_balancing',
+                nb,
+                0,
+            )
+        )
+    sockets = set()
+    for line in read_file(['/proc/cpuinfo']).splitlines():
+        if line.startswith('physical id'):
+            sockets.add(line.split(':', 1)[1].strip())
+    per_socket = len(nodes) // max(1, len(sockets))
+    results.append(
+        _result(
+            'numa',
+            STATUS_INFO,
+            '%d NUMA nodes on %d sockets%s'
+            % (
+                len(nodes),
+                len(sockets),
+                ' (AMD NPS%d)' % per_socket if 'EPYC' in _cpu_model() else '',
+            ),
+        )
+    )
+    return results
+
+
+def check_nic_tuning(ctx: CephadmContext) -> List[Dict[str, Any]]:
+    results = []
+    nics = host_hw.physical_nics()
+    multiqueue = [
+        i
+        for i in nics
+        if len(glob(os.path.join(SYS_NET, i, 'queues', 'rx-*'))) > 1
+    ]
+    if multiqueue:
+        r = host_hw._run(ctx, ['systemctl', 'is-active', 'irqbalance'])
+        if r is not None and r[0].strip() != 'active':
+            results.append(
+                _result(
+                    'irqbalance',
+                    STATUS_INFO,
+                    'irqbalance is not running; without it or manual IRQ '
+                    'affinity, NIC interrupts may all land on one CPU',
+                    value=r[0].strip() or 'inactive',
+                )
+            )
+    for iface in nics:
+        if _read(os.path.join(SYS_NET, iface, 'operstate')) != 'up':
+            continue
+        r = host_hw._run(ctx, ['ethtool', '-g', iface])
+        if r and not r[1]:
+            maxes = re.search(r'maximums:.*?RX:\s*(\d+)', r[0], re.S)
+            cur = re.search(
+                r'Current hardware settings:.*?RX:\s*(\d+)', r[0], re.S
+            )
+            if maxes and cur and int(cur.group(1)) < int(maxes.group(1)):
+                results.append(
+                    _result(
+                        'nic_rings',
+                        STATUS_INFO,
+                        'RX ring is smaller than the maximum; small rings drop '
+                        'packets under bursts',
+                        iface,
+                        int(cur.group(1)),
+                        int(maxes.group(1)),
+                    )
+                )
+        r = host_hw._run(ctx, ['ethtool', '-k', iface])
+        if r and not r[1]:
+            off = [
+                k
+                for k in (
+                    'tcp-segmentation-offload',
+                    'generic-segmentation-offload',
+                    'generic-receive-offload',
+                )
+                if re.search(r'^%s:\s*off' % k, r[0], re.M)
+            ]
+            if off:
+                results.append(
+                    _result(
+                        'nic_offloads',
+                        STATUS_INFO,
+                        'offloads are off, which costs CPU per packet',
+                        iface,
+                        ','.join(off),
+                        'on',
+                    )
+                )
+    return results
+
+
 CHECKS = [
     ('sysctl', check_sysctls),
     ('thp', check_thp),
     ('tuned', check_tuned),
     ('cpu_governor', check_cpu_governor),
     ('kernel', check_kernel),
+    ('power', check_power),
+    ('numa', check_numa),
     ('swap', check_swap),
     ('disks', check_block_devices),
     ('sizing', check_sizing),
+    ('smart', check_smart),
+    ('pcie', check_pcie),
+    ('ipmi', check_ipmi),
+    ('nic_errors', check_nic_errors),
+    ('nic_tuning', check_nic_tuning),
 ]
+
+
+def check_peers(
+    ctx: CephadmContext, peers: List[str]
+) -> List[Dict[str, Any]]:
+    from .net_test import ping_peers
+
+    results = []
+    for r in ping_peers(ctx, peers):
+        target = '%s (%s)' % (r['peer'], r['addr'])
+        if 'error' in r:
+            results.append(_result('ping', STATUS_FAIL, r['error'], target))
+            continue
+        small, big = r['small'], r['full_mtu']
+        rtt = small.get('rtt_avg_ms')
+        if not small['ok'] and not big['ok']:
+            results.append(
+                _result('ping', STATUS_FAIL, 'peer is unreachable', target)
+            )
+        elif small['ok'] and not big['ok']:
+            results.append(
+                _result(
+                    'ping',
+                    STATUS_FAIL,
+                    'small pings work but %d-byte packets with DF set do '
+                    'not: the path MTU is below the local MTU, so jumbo '
+                    'frames are not configured end to end' % r['mtu'],
+                    target,
+                    'mtu %d via %s' % (r['mtu'], r['iface']),
+                )
+            )
+        elif small.get('loss_pct') or big.get('loss_pct'):
+            results.append(
+                _result(
+                    'ping',
+                    STATUS_WARN,
+                    'packet loss',
+                    target,
+                    'small %s%%, full MTU %s%%'
+                    % (small.get('loss_pct'), big.get('loss_pct')),
+                )
+            )
+        else:
+            results.append(
+                _result(
+                    'ping',
+                    STATUS_OK,
+                    'reachable at MTU %d via %s' % (r['mtu'], r['iface']),
+                    target,
+                    '%s ms' % rtt if rtt is not None else None,
+                )
+            )
+    return results
+
+
+def check_groups() -> List[str]:
+    return [name for name, _ in CHECKS] + ['firmware', 'network', 'ping']
 
 
 def run_checks(
     ctx: CephadmContext,
     networks: Optional[List[str]] = None,
     skip: Optional[List[str]] = None,
+    peers: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    skip = skip or []
+    skipped = set(skip or [])
     results: List[Dict[str, Any]] = []
-    for name, fn in CHECKS:
-        if name in skip:
-            continue
+    report: Dict[str, Any] = {}
+
+    def run(name: str, fn: Any, *args: Any) -> None:
+        if name in skipped:
+            return
         try:
-            results.extend(fn(ctx))
+            results.extend(fn(ctx, *args))
         except Exception as e:
             logger.debug('check %s failed', name, exc_info=True)
             results.append(
                 _result(name, STATUS_INFO, 'check could not run: %s' % e)
             )
-    if 'network' not in skip:
+
+    for name, fn in CHECKS:
+        run(name, fn)
+    if 'firmware' not in skipped:
+        # also returned, so the mgr can compare firmware across hosts
         try:
-            results.extend(check_network(ctx, networks))
-        except Exception as e:
-            logger.debug('network check failed', exc_info=True)
-            results.append(
-                _result('network', STATUS_INFO, 'check could not run: %s' % e)
-            )
+            report['inventory'] = firmware_inventory(ctx)
+        except Exception:
+            logger.debug('firmware inventory failed', exc_info=True)
+        run('firmware', check_firmware, report.get('inventory'))
+    run('network', check_network, networks)
+    if peers:
+        run('ping', check_peers, peers)
     summary = {s: 0 for s in STATUS_ORDER}
     for r in results:
         summary[r['status']] += 1
-    return {'summary': summary, 'checks': results}
+    report.update({'summary': summary, 'checks': results})
+    return report
 
 
 def format_report(report: Dict[str, Any]) -> str:
