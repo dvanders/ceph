@@ -127,10 +127,57 @@ has the cluster's SSH key. The checks cover:
   ``cluster_network``.
 * whether the host has enough memory and CPU threads for one OSD on each of
   its data disks. Mounted disks are not counted.
+* power management: deep CPU idle states (C-states) that take more than 10
+  microseconds to exit, a CPU energy/performance preference other than
+  ``performance``, PCIe ASPM, NVMe autonomous power state transitions
+  (APST), and Energy-Efficient Ethernet on NICs. Each of these adds latency
+  to I/O. See :ref:`cephadm-host-tune` to turn them off.
+* NUMA: ``vm.zone_reclaim_mode`` and automatic NUMA balancing on hosts with
+  more than one NUMA node, and the node layout (NPS) on AMD EPYC.
+* NIC tuning: ``irqbalance`` not running on a host with multi-queue NICs,
+  RX rings smaller than their maximum, and segmentation or receive offloads
+  that are off.
+* disk health from SMART (with ``smartctl``): the overall health status,
+  reallocated, pending and offline-uncorrectable sectors, interface CRC
+  errors (usually a bad cable or backplane), the ATA error log, failed
+  self-tests, and for NVMe the critical warning, media errors, spare and
+  endurance.
+* PCIe links of NICs, NVMe drives and storage controllers that trained at a
+  lower width or speed than the device supports, and whether the slot is
+  what limits them.
+* firmware: disks or NICs of one model that run different firmware. When
+  run from the mgr, disk firmware is also compared with the other hosts in
+  the cluster.
+* NIC error counters (CRC, frame, FIFO, missed, carrier) and driver drop and
+  discard counters from ``ethtool -S``.
+* the BMC (with ``ipmitool``): hardware errors and thermal events in the
+  system event log, and sensors in a critical or non-critical state.
+* when run from the mgr, pings of every other host, on each Ceph network,
+  with small packets and with packets of the full interface MTU and the
+  don't-fragment bit set. If only the small pings get through, jumbo frames
+  are not configured end to end.
+
+Checks that need ``smartctl``, ``ethtool`` or ``ipmitool`` report ``info``
+when the tool is not installed on the host.
 
 Each result is ``ok``, ``info``, ``warn`` or ``fail``. The checks can also be
 run directly on a host with ``cephadm host-precheck``, which accepts
-``--network <cidr>``, ``--skip <group>`` and ``--fail-on-warn``.
+``--network <cidr>``, ``--peer [<name>=]<ip>``, ``--skip <group>`` and
+``--fail-on-warn``.
+
+cephadm also runs the checks on every host once a day, and raises the
+``CEPHADM_HOST_PRECHECK`` health warning for hosts with ``warn`` or ``fail``
+results. These options control it:
+
+* ``mgr/cephadm/host_precheck_interval``: how often, in seconds (default
+  86400; 0 turns the periodic check and the health warning off).
+* ``mgr/cephadm/host_precheck_health_level``: ``warn`` (default) raises the
+  warning for ``warn`` and ``fail`` results, ``fail`` only for ``fail``.
+* ``mgr/cephadm/host_precheck_skip``: check groups to skip, comma-separated,
+  for problems that are known and accepted (for example ``kernel`` for CPU
+  mitigations, or ``nic_tuning``).
+* ``mgr/cephadm/host_precheck_max_peers``: how many other hosts each host
+  pings in the periodic check (default 32; 0 for all).
 
 ``ceph orch host add`` runs these checks against every new host and appends
 any ``warn`` or ``fail`` results to its output. The
@@ -144,6 +191,71 @@ any ``warn`` or ``fail`` results to its output. The
 
    ceph config set mgr mgr/cephadm/host_precheck_on_add enforce
 
+.. _cephadm-host-tune:
+
+Tuning a Host for Latency
+=========================
+
+``host-tune`` fixes what host-precheck reports: power management, sysctls,
+services and missing tools:
+
+.. prompt:: bash #
+
+   ceph cephadm host-tune <host> [--apply] [--cmdline] [--iommu-off] [--mitigations-off]
+       [--no-packages] [--nic-rings]
+   ceph cephadm host-tune <host> --remove
+
+Without ``--apply`` it only shows what it would change. With ``--apply`` it
+sets the ``performance`` CPU governor and energy preference, disables CPU
+idle states that take more than 10 microseconds to exit, sets the PCIe ASPM
+policy to ``performance``, disables NVMe APST, sets transparent huge pages
+to ``madvise``, turns off Energy-Efficient Ethernet, sets ``mq-deadline`` on
+HDDs and ``none`` on flash, and on NUMA hosts sets ``vm.zone_reclaim_mode``
+and ``kernel.numa_balancing`` to 0. It persists the sysctl values that
+host-precheck recommends, such as ``vm.swappiness`` and the TCP buffer
+limits; values only move toward the recommendation, and the settings cephadm
+applies when it deploys an OSD are left to cephadm.
+
+It also installs the tools that host-precheck and the burn-in use, if they
+are missing: ``smartmontools``, ``nvme-cli``, ``ethtool``, ``tuned``,
+``irqbalance``, ``ipmitool`` (only on hosts with a BMC), ``stress-ng`` and
+``iperf3``. Each package is installed on its own, so one that the configured
+repositories do not provide (for example ``stress-ng`` on EL without EPEL)
+does not stop the others; host-tune never adds repositories.
+``--no-packages`` skips this. It enables ``tuned`` and ``irqbalance``, and
+sets tuned's profile to ``throughput-performance`` unless tuned already runs
+a performance profile such as ``network-latency`` or a custom profile from
+``/etc/tuned``. On hosts with a BMC it loads the ``ipmi_si`` and
+``ipmi_devintf`` kernel modules at boot.
+
+``--nic-rings`` also grows NIC RX and TX rings to their maximum. This
+briefly resets the link on many drivers, so it is not done by default.
+
+The settings apply immediately and again at every boot, from the
+``ceph-host-tune`` systemd unit, a udev rule and a ``sysctl.d`` file.
+
+``--cmdline`` also adds kernel arguments, which take effect at the next
+reboot: ``processor.max_cstate=1 intel_idle.max_cstate=0 pcie_aspm=off
+nvme_core.default_ps_max_latency_us=0``. On RHEL-family hosts they are added
+with ``grubby``. On hosts without ``grubby`` (Debian, Ubuntu, SUSE) they are
+added to ``GRUB_CMDLINE_LINUX`` in ``/etc/default/grub``, of which a copy is
+kept as ``/etc/default/grub.ceph-host-tune.bak``, and the grub configuration
+is regenerated with ``update-grub`` or ``grub2-mkconfig``. On hosts with
+another boot loader, the output lists the arguments to add by hand. ``--iommu-off`` adds
+``amd_iommu=off`` (AMD EPYC only), and ``--mitigations-off`` adds
+``mitigations=off``.
+
+.. warning::
+
+   ``mitigations=off`` removes the kernel's protection against CPU
+   vulnerabilities such as Spectre and Meltdown. Use it only on dedicated
+   OSD hosts, not on hosts that also run hypervisors or other clients.
+
+``--remove`` removes the unit, script, udev rule, ``sysctl.d`` and
+``modules-load.d`` files. The runtime settings stay until the next reboot,
+installed packages and enabled services stay, and kernel arguments are left
+as they are; the output shows how to remove them.
+
 .. _cephadm-host-burnin:
 
 Burning In a Host
@@ -153,6 +265,9 @@ Before a new host holds data, you can stress its CPUs, memory and disks to
 find hardware that fails early. The burn-in runs in the background on the
 host as the transient systemd unit ``ceph-burnin``, needs nothing beyond
 python, and does not require the host to have been added to the cluster.
+
+A burn-in refuses to start on a host that runs any Ceph process, including
+containerized daemons.
 
 .. prompt:: bash #
 
@@ -165,11 +280,13 @@ python, and does not require the host to have been added to the cluster.
 With no test selected, a burn-in runs all three for an hour (``--duration
 3600``):
 
-* ``cpu``: one process per CPU runs hashing, compression and floating point
-  loops, checking every result against a reference. A mismatch means the CPU
-  computed a wrong result.
-* ``memory``: fills ``--memory-percent`` (default 70) of the available memory
-  with changing patterns and reads it back.
+* ``cpu`` and ``memory``: if ``stress-ng`` is installed on the host (see
+  :ref:`cephadm-host-tune`), it runs all of its CPU and memory (``vm``)
+  methods with ``--verify``, and any verification failure fails the burn-in. Otherwise, or with ``--engine
+  builtin``, one process per CPU runs hashing, compression and floating
+  point loops, checking every result against a reference, and memory
+  workers fill ``--memory-percent`` (default 70) of the available memory
+  with changing patterns and read it back.
 * ``disk``: sequential and random ``O_DIRECT`` reads of every unused non-OS
   device, reporting throughput, latency and I/O errors.
 
@@ -188,12 +305,15 @@ next burn-in resumes each disk where the previous one stopped, so a series
 of shorter runs also covers the whole surface. Pass ``--from-start`` to start
 at the beginning instead.
 
-When the run ends, the host's EDAC memory error counters and CPU thermal
-throttling counters are compared with their values at the start, and the
-kernel log is searched for hardware errors. The run fails if any worker saw
-an error, an uncorrectable memory error was counted, or the kernel logged a
-hardware error. Correctable memory errors and thermal throttling are
-reported as warnings. If the host has no EDAC or thermal throttle counters,
+When the run ends, these are compared with their values at the start: the
+EDAC memory error counters, the CPU thermal throttling counters, the BMC
+event log (with ``ipmitool``), the SMART error counters of the tested disks,
+and the NIC error counters. The kernel log is searched for hardware errors.
+The run fails if any worker saw an error, an uncorrectable memory error was
+counted, the BMC logged a hardware error, a tested disk gained reallocated,
+pending or uncorrectable sectors, or the kernel logged a hardware error.
+Correctable memory errors, thermal throttling or BMC thermal events, SMART
+CRC errors and NIC errors are reported as warnings. If the host has no EDAC or thermal throttle counters,
 for example because it has no ECC memory, the result says so, because zero
 errors then proves nothing.
 
@@ -220,6 +340,21 @@ reads them back to detect corruption and misdirected writes.
 The same tests can be run directly on a host with ``cephadm burnin
 start|run|status|stop``. ``run`` stays in the foreground and exits non-zero
 if the burn-in fails.
+
+To test the network between a host and the rest of the cluster, run:
+
+.. prompt:: bash #
+
+   ceph cephadm burnin network <host> [--peers <host> ...] [--duration 10] [--parallel 4]
+
+For each other host (or each of ``--peers``), on each Ceph network they
+share, cephadm starts an ``iperf3`` server on the peer and runs a
+bidirectional test from the host. It reports the throughput in each
+direction and the TCP retransmits, and flags a direction below 70% of the
+link speed and NIC error counters that increased during the test. The host
+must not run any Ceph daemons, and ``iperf3`` must be installed on both
+hosts. If ``firewalld`` or ``ufw`` is active on the peer, the iperf3 port (5201 by
+default) is opened for the duration of the test only.
 
 .. _cephadm-removing-hosts:
 
