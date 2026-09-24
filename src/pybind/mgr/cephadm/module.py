@@ -83,6 +83,7 @@ from orchestrator._interface import daemon_type_to_service
 from . import utils
 from . import ssh
 from .cli import CephadmCLICommand
+from .host_precheck import HostPrecheck, problems as precheck_problems
 from .migrations import Migrations
 from .services.cephadmservice import MgrService, RgwService
 from .services.container import CustomContainerService
@@ -284,6 +285,35 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
             long_desc='off: skip the checks. warn: add the host and report any '
             'warn or fail results. enforce: refuse to add a host with any warn '
             'or fail result.',
+        ),
+        Option(
+            'host_precheck_interval',
+            type='secs',
+            default=24 * 60 * 60,
+            desc='How often to run host-precheck on every host and update '
+            'the CEPHADM_HOST_PRECHECK health warning (0 to disable)',
+        ),
+        Option(
+            'host_precheck_health_level',
+            type='str',
+            default='warn',
+            enum_allowed=['warn', 'fail'],
+            desc='Which host-precheck results raise CEPHADM_HOST_PRECHECK: '
+            'warn and fail, or only fail',
+        ),
+        Option(
+            'host_precheck_skip',
+            type='str',
+            default='',
+            desc='Comma-separated host-precheck check groups to skip, e.g. '
+            'cpu_mitigations are part of "kernel", SMART is "smart"',
+        ),
+        Option(
+            'host_precheck_max_peers',
+            type='int',
+            default=32,
+            desc='How many other hosts the periodic host-precheck pings from '
+            'each host (0 for all)',
         ),
         Option(
             'log_to_cluster',
@@ -649,6 +679,10 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
             self.warn_on_stray_daemons = True
             self.warn_on_failed_host_check = True
             self.host_precheck_on_add = 'warn'
+            self.host_precheck_interval = 86400
+            self.host_precheck_health_level = 'warn'
+            self.host_precheck_skip = ''
+            self.host_precheck_max_peers = 32
             self.allow_ptrace = False
             self.container_init = True
             self.prometheus_alerts_path = ''
@@ -787,6 +821,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
         self.need_connect_dashboard_rgw = False
 
         self.config_checker = CephadmConfigChecks(self)
+        self.precheck = HostPrecheck(self)
 
         self.http_server = CephadmHttpServer(self)
         self.http_server.start()
@@ -1682,63 +1717,21 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
                     self.event.set()
         return 0, '%s (%s) ok' % (host, addr), '\n'.join(err)
 
-    def _ceph_networks(self) -> List[str]:
-        nets: List[str] = []
-        for opt in ('public_network', 'cluster_network'):
-            val = str(self.get_foreign_ceph_option('mon', opt) or '')
-            for n in val.split(','):
-                n = n.strip()
-                if '/' in n and n not in nets:
-                    nets.append(n)
-        return nets
-
-    def _run_host_precheck(self, host: str, addr: Optional[str] = None) -> Dict[str, Any]:
-        args = ['--format', 'json']
-        for net in self._ceph_networks():
-            args += ['--network', net]
-        with self.async_timeout_handler(host, 'cephadm host-precheck'):
-            out, err, code = self.wait_async(
-                CephadmServe(self)._run_cephadm(
-                    host, cephadmNoImage, 'host-precheck', args,
-                    addr=addr, error_ok=True, no_fsid=True))
-        try:
-            report = json.loads(''.join(out))
-        except ValueError:
-            report = None
-        if not isinstance(report, dict) or 'checks' not in report:
-            raise OrchestratorError(
-                f'host-precheck failed on {host} (exit {code}):\n' + '\n'.join(err))
-        return report
-
-    @staticmethod
-    def _host_precheck_problems(report: Dict[str, Any]) -> List[str]:
-        out = []
-        for r in report.get('checks', []):
-            if r.get('status') not in ('warn', 'fail'):
-                continue
-            line = '%s %s' % (r['status'].upper(), r['check'])
-            if r.get('target'):
-                line += ' ' + r['target']
-            line += ': ' + r.get('message', '')
-            if 'value' in r:
-                line += ' (value: %s' % r['value']
-                if 'expected' in r:
-                    line += ', expected: %s' % r['expected']
-                line += ')'
-            out.append(line)
-        return out
-
     @CephadmCLICommand.Read('cephadm host-precheck')
     def host_precheck(self, host: str, addr: Optional[str] = None,
                       format: Format = Format.plain) -> HandleCommandResult:
-        """Check the tuning of a (possibly not yet added) host: sysctls, tuned, CPU
-        governor, THP, IO schedulers, NICs and sizing"""
+        """Check the tuning and hardware health of a (possibly not yet added) host:
+        sysctls, power management, SMART, PCIe links, firmware, NIC errors, BMC
+        event log, and pings of the other hosts at full MTU"""
         if not addr and host in self.inventory:
             addr = self.inventory.get_addr(host)
         try:
-            report = self._run_host_precheck(host, addr=addr or host)
+            report = self.precheck.run(host, addr=addr or host)
         except (OrchestratorError, ssh.HostConnectionError) as e:
             return HandleCommandResult(retval=1, stderr=str(e))
+        if host in self.inventory:
+            self.precheck.record(host, report)
+            self.precheck.update_health()
         if format != Format.plain:
             return HandleCommandResult(stdout=to_format(report, format, many=False, cls=None))
         table = PrettyTable(['STATUS', 'CHECK', 'TARGET', 'VALUE', 'EXPECTED', 'MESSAGE'],
@@ -1838,6 +1831,131 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
                   format: Format = Format.plain) -> HandleCommandResult:
         """List the burn-in runs kept on a host"""
         return self._burnin_query(host, ['list'], addr, format)
+
+    @CephadmCLICommand.Write('cephadm burnin network')
+    def burnin_network(self,
+                       host: str,
+                       peers: Optional[List[str]] = None,
+                       duration: int = 10,
+                       parallel: int = 4,
+                       port: int = 5201) -> HandleCommandResult:
+        """Bidirectional iperf3 tests between a host and each peer (default: all
+        other hosts), on every Ceph network they share"""
+        if host not in self.inventory:
+            return HandleCommandResult(
+                retval=-errno.ENOENT,
+                stderr=f"Host '{host}' not found. Use 'ceph orch host ls' to see all managed hosts.")
+        daemons = self.cache.get_daemons_by_host(host)
+        if daemons:
+            return HandleCommandResult(
+                retval=-errno.EBUSY,
+                stderr=f'refusing to burn in {host}, which runs Ceph daemons: '
+                + ', '.join(d.name() for d in daemons[:10]))
+        targets = self.precheck.peers(host)
+        if peers:
+            targets = [t for t in targets if t.split('=', 1)[0] in peers]
+        if not targets:
+            return HandleCommandResult(retval=-errno.EINVAL, stderr='no peers to test against')
+        results = []
+        for target in targets:
+            peer = target.split('=', 1)[0]
+            results.append(self._iperf_pair(host, peer, target, duration, parallel, port))
+        table = PrettyTable(['PEER', 'ADDR', 'IFACE', 'LINK', 'TO PEER', 'FROM PEER',
+                             'RETRANS', 'PROBLEMS'], border=False)
+        table.align = 'l'
+        table.left_padding_width = 0
+        table.right_padding_width = 2
+        bad = 0
+        for r in results:
+            probs = ([r['error']] if r.get('error') else []) + r.get('problems', [])
+            bad += bool(probs)
+            link = r.get('link_mbps')
+            table.add_row((
+                r.get('peer'), r.get('addr'), r.get('iface') or '',
+                '%d Gb/s' % (link // 1000) if link else '',
+                '%s Gb/s' % r['to_peer_gbps'] if r.get('to_peer_gbps') is not None else '',
+                '%s Gb/s' % r['from_peer_gbps'] if r.get('from_peer_gbps') is not None else '',
+                '%s/%s' % (r.get('to_peer_retransmits'), r.get('from_peer_retransmits'))
+                if 'to_peer_retransmits' in r else '',
+                '; '.join(str(p) for p in probs)))
+        return HandleCommandResult(
+            retval=1 if bad else 0,
+            stdout=table.get_string() + '\n%d of %d tests had problems' % (bad, len(results)))
+
+    def _iperf_pair(self, host: str, peer: str, target: str, duration: int,
+                    parallel: int, port: int) -> Dict[str, Any]:
+        """Start an iperf3 server on peer, test from host, stop the server."""
+        base = {'peer': peer, 'addr': target.split('=', 1)[1]}
+        timeout = duration * 3 + 60
+        r = self._net_test(peer, ['iperf-server', '--port', str(port),
+                                  '--timeout-secs', str(timeout)], timeout)
+        if 'error' in r:
+            return dict(base, error=f'iperf3 server on {peer}: {r["error"]}')
+        try:
+            r = self._net_test(host, ['iperf-client', '--peer', target, '--port', str(port),
+                                      '--duration', str(duration),
+                                      '--parallel', str(parallel)], timeout)
+        finally:
+            self._net_test(peer, ['iperf-stop', '--port', str(port)], 60)
+        return dict(base, **r)
+
+    def _net_test(self, host: str, args: List[str], timeout: int) -> Dict[str, Any]:
+        try:
+            with self.async_timeout_handler(host, 'cephadm net-test ' + args[0]):
+                out, err, code = self.wait_async(
+                    CephadmServe(self)._run_cephadm(
+                        host, cephadmNoImage, 'net-test', args,
+                        error_ok=True, no_fsid=True, timeout=timeout))
+        except (OrchestratorError, ssh.HostConnectionError) as e:
+            return {'error': str(e)}
+        try:
+            data = json.loads(''.join(out))
+            if isinstance(data, dict):
+                return data
+        except ValueError:
+            pass
+        lines = '\n'.join(err).splitlines()
+        errors = [e.replace('ERROR: ', '') for e in lines if e.startswith('ERROR')]
+        return {'error': '; '.join(errors or lines[-1:]) or f'exit {code}'}
+
+    @CephadmCLICommand.Write('cephadm host-tune')
+    def host_tune(self,
+                  host: str,
+                  apply: bool = False,
+                  remove: bool = False,
+                  cmdline: bool = False,
+                  iommu_off: bool = False,
+                  mitigations_off: bool = False,
+                  no_packages: bool = False,
+                  nic_rings: bool = False,
+                  addr: Optional[str] = None) -> HandleCommandResult:
+        """Show (default), apply or remove what host-precheck reports on a host: CPU
+        governor and C-states, PCIe ASPM, NVMe APST, THP, I/O schedulers, NIC EEE,
+        sysctls, tuned, irqbalance and missing tools; --cmdline also adds kernel
+        arguments (effective after reboot)"""
+        if apply and remove:
+            return HandleCommandResult(retval=-errno.EINVAL,
+                                       stderr='--apply and --remove are exclusive')
+        args = []
+        for flag, on in (('--apply', apply), ('--remove', remove), ('--cmdline', cmdline),
+                         ('--iommu-off', iommu_off), ('--mitigations-off', mitigations_off),
+                         ('--no-packages', no_packages), ('--nic-rings', nic_rings)):
+            if on:
+                args.append(flag)
+        if not addr:
+            addr = self.inventory.get_addr(host) if host in self.inventory else host
+        try:
+            with self.async_timeout_handler(host, 'cephadm host-tune'):
+                out, err, code = self.wait_async(
+                    CephadmServe(self)._run_cephadm(
+                        host, cephadmNoImage, 'host-tune', args,
+                        addr=addr, error_ok=True, no_fsid=True))
+        except ssh.HostConnectionError as e:
+            return HandleCommandResult(retval=1, stderr=str(e))
+        lines = '\n'.join(err).splitlines()
+        errors = [e.replace('ERROR: ', '') for e in lines if e.startswith('ERROR')]
+        return HandleCommandResult(retval=1 if code else 0, stdout=''.join(out),
+                                   stderr='\n'.join(errors))
 
     @CephadmCLICommand.Write('cephadm burnin stop')
     def burnin_stop(self, host: str, addr: Optional[str] = None) -> HandleCommandResult:
@@ -2515,13 +2633,15 @@ Then run the following:
         if mode == 'off':
             return ''
         try:
-            report = self._run_host_precheck(host, addr=addr)
+            report = self.precheck.run(host, addr=addr)
         except Exception as e:
             if mode == 'enforce':
                 raise OrchestratorError(f'host-precheck of {host} failed: {e}')
             self.log.warning(f'host-precheck of {host} failed: {e}')
             return f'host-precheck could not run: {e}'
-        problems = self._host_precheck_problems(report)
+        # the daily check of this host counts from now
+        self.precheck.record(host, report)
+        problems = precheck_problems(report)
         if not problems:
             return ''
         detail = '\n'.join('  ' + p for p in problems)

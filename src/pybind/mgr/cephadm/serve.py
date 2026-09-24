@@ -324,6 +324,10 @@ class CephadmServe:
                 if r:
                     failures.append(r)
 
+            if self.mgr.precheck.needs_run(host):
+                self.log.debug(f"running host-precheck on {host}")
+                self.mgr.precheck.run_periodic(host)
+
             if (
                     self.mgr.cache.host_needs_autotune_memory(host)
                     and not self.mgr.inventory.has_label(host, SpecialHostLabels.NO_MEMORY_AUTOTUNE)
@@ -335,6 +339,7 @@ class CephadmServe:
 
         self._write_all_client_files()
 
+        self.mgr.precheck.update_health()
         self.mgr.agent_helpers._update_agent_down_healthcheck(agents_down)
         self.mgr.http_server.config_update()
 
