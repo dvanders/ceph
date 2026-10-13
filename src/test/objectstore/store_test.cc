@@ -14411,3 +14411,144 @@ int main(int argc, char **argv) {
  *  "
  * End:
  */
+
+// Reproducers from the #57631 review: deep-scrub reformat on EC-style reads
+// past EOF, and defragment filling holes.
+
+#define REPRO_PROLOGUE(OPTVAL)                                              \
+  SetVal(g_conf(), "bluestore_debug_enforce_settings", "ssd");              \
+  SetVal(g_conf(), "bluestore_allocator_lookup_policy", "hdd_optimized");   \
+  SetVal(g_conf(), "bluestore_write_v2", GetParam());                       \
+  g_conf().apply_changes(nullptr);                                          \
+  DeferredSetup();                                                          \
+  int r;                                                                    \
+  coll_t cid;                                                               \
+  ghobject_t obj(hobject_t(sobject_t("Object 1", CEPH_NOSNAP)));            \
+  auto ch = store->create_new_collection(cid);                              \
+  const PerfCounters* logger = store->get_perf_counters();                  \
+  pool_opts_t popts;                                                        \
+  popts.set(pool_opts_t::DEEP_SCRUB_REFORMAT, std::string(OPTVAL));         \
+  store->set_collection_opts(ch, popts);                                    \
+  {                                                                         \
+    ObjectStore::Transaction t;                                             \
+    t.create_collection(cid, 0);                                            \
+    r = queue_transaction(store, ch, std::move(t));                         \
+    ASSERT_EQ(r, 0);                                                        \
+  }                                                                         \
+  auto wait_fn = [&]() {                                                    \
+    C_SaferCond c;                                                          \
+    ObjectStore::Transaction t;                                             \
+    t.touch(cid, obj);                                                      \
+    t.register_on_complete(&c);                                             \
+    r = queue_transaction(store, ch, std::move(t));                         \
+    ASSERT_EQ(r, 0);                                                        \
+    c.wait();                                                               \
+  };
+
+// write len bytes of 'a', then overwrite every other 4K with 'c' -> fragmented
+#define REPRO_FRAGMENT(LEN, EXPECTED)                                       \
+  {                                                                         \
+    bufferlist bl; bl.append(std::string(LEN, 'a'));                        \
+    C_SaferCond c; ObjectStore::Transaction t;                              \
+    t.write(cid, obj, 0, LEN, bl, 0); t.register_on_commit(&c);            \
+    ASSERT_EQ(0, queue_transaction(store, ch, std::move(t))); c.wait();    \
+    wait_fn();                                                              \
+    C_SaferCond c2; ObjectStore::Transaction t2;                            \
+    bufferlist c4; c4.append(std::string(4096, 'c'));                       \
+    std::string exp(LEN, 'a');                                              \
+    for (uint64_t pos = 0; pos + 4096 <= LEN; pos += 8192) {                \
+      t2.write(cid, obj, pos, 4096, c4, 0);                                 \
+      exp.replace(pos, 4096, std::string(4096, 'c'));                       \
+    }                                                                       \
+    t2.register_on_commit(&c2);                                             \
+    ASSERT_EQ(0, queue_transaction(store, ch, std::move(t2))); c2.wait();  \
+    wait_fn();                                                              \
+    EXPECTED.append(exp);                                                   \
+  }
+
+TEST_P(StoreTestReformatting, ReproPastEOFFromZero) {
+  REPRO_PROLOGUE("defragment");
+  const uint64_t len = 127 * 1024;
+  bufferlist expected;
+  REPRO_FRAGMENT(len, expected);
+  bufferlist bl;
+  // EC deep scrub reads a full stride (4M) even near EOF
+  r = store->read(ch, obj, 0, 4 << 20, bl,
+                  CEPH_OSD_OP_FLAG_FADVISE_DONTNEED | CEPH_OSD_OP_FLAG_SCRUB);
+  cerr << "REPRO read r=" << r << " bl=" << bl.length()
+       << " issued=" << logger->get(l_bluestore_reformat_issued) << std::endl;
+  ASSERT_EQ(r, (int)len);
+  wait_fn();
+  struct stat st;
+  ASSERT_EQ(0, store->stat(ch, obj, &st));
+  cerr << "REPRO size after=" << st.st_size << " (expected " << len << ")" << std::endl;
+  EXPECT_EQ((uint64_t)st.st_size, len);
+  bufferlist after;
+  ASSERT_EQ((int)len, store->read(ch, obj, 0, len, after, 0));
+  EXPECT_TRUE(bl_eq(expected, after));
+}
+
+TEST_P(StoreTestReformatting, ReproPastEOFFromOffset) {
+  REPRO_PROLOGUE("defragment");
+  const uint64_t len = 127 * 1024;
+  bufferlist expected;
+  REPRO_FRAGMENT(len, expected);
+  bufferlist bl;
+  r = store->read(ch, obj, 64 * 1024, 4 << 20, bl,
+                  CEPH_OSD_OP_FLAG_FADVISE_DONTNEED | CEPH_OSD_OP_FLAG_SCRUB);
+  cerr << "REPRO read r=" << r << " bl=" << bl.length()
+       << " issued=" << logger->get(l_bluestore_reformat_issued) << std::endl;
+  ASSERT_EQ(r, (int)(len - 64 * 1024));
+  wait_fn();
+  struct stat st;
+  ASSERT_EQ(0, store->stat(ch, obj, &st));
+  cerr << "REPRO size after=" << st.st_size << " (expected " << len << ")" << std::endl;
+  EXPECT_EQ((uint64_t)st.st_size, len);
+  bufferlist after;
+  ASSERT_EQ((int)len, store->read(ch, obj, 0, len, after, 0));
+  EXPECT_TRUE(bl_eq(expected, after));
+}
+
+TEST_P(StoreTestReformatting, ReproUnknownToken) {
+  // "both" is what the PR description documents
+  REPRO_PROLOGUE("both");
+  const uint64_t len = 127 * 1024;
+  bufferlist expected;
+  REPRO_FRAGMENT(len, expected);
+  bufferlist bl;
+  r = store->read(ch, obj, 0, len, bl,
+                  CEPH_OSD_OP_FLAG_FADVISE_DONTNEED | CEPH_OSD_OP_FLAG_SCRUB);
+  cerr << "REPRO unknown-token read r=" << r << " issued="
+       << logger->get(l_bluestore_reformat_issued) << std::endl;
+  ASSERT_EQ(r, (int)len);
+}
+
+TEST_P(StoreTestReformatting, ReproHoleFill) {
+  REPRO_PROLOGUE("defragment");
+  // sparse, fragmented object: 4K data every 16K over 1M, rest are holes
+  const uint64_t len = 1 << 20;
+  {
+    C_SaferCond c; ObjectStore::Transaction t;
+    bufferlist d; d.append(std::string(4096, 'd'));
+    for (uint64_t pos = 0; pos < len; pos += 16384)
+      t.write(cid, obj, pos, 4096, d, 0);
+    t.register_on_commit(&c);
+    ASSERT_EQ(0, queue_transaction(store, ch, std::move(t))); c.wait();
+  }
+  wait_fn();
+  store_statfs_t before, after;
+  ASSERT_EQ(0, store->statfs(&before));
+  struct stat hst;
+  ASSERT_EQ(0, store->stat(ch, obj, &hst));
+  const uint64_t size = hst.st_size;
+  bufferlist bl;
+  r = store->read(ch, obj, 0, size, bl,
+                  CEPH_OSD_OP_FLAG_FADVISE_DONTNEED | CEPH_OSD_OP_FLAG_SCRUB);
+  ASSERT_EQ(r, (int)size);
+  wait_fn();
+  ASSERT_EQ(0, store->statfs(&after));
+  cerr << "REPRO hole-fill issued=" << logger->get(l_bluestore_reformat_issued)
+       << " data_stored " << before.data_stored << " -> " << after.data_stored
+       << " allocated " << before.allocated << " -> " << after.allocated << std::endl;
+  EXPECT_LE(after.allocated, before.allocated);
+}
