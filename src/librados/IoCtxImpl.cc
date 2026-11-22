@@ -535,6 +535,12 @@ int librados::IoCtxImpl::nlist(Objecter::NListContext *context, int max_entries)
 
   context->max_entries = max_entries;
   context->nspace = oloc.nspace;
+  objecter->with_osdmap([&](const OSDMap& o) {
+    // a virtual pool is listed as a namespace of its base pool
+    if (o.get_vpool_base(poolid) >= 0) {
+      context->nspace = OSDMap::vpool_nspace_prefix(poolid) + oloc.nspace;
+    }
+  });
 
   objecter->list_nobjects(context, new C_SafeCond(mylock, cond, &done, &r));
 

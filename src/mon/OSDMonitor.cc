@@ -17013,6 +17013,65 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
     if (err < 0)
       goto reply_no_propose;
     goto update;
+  } else if (prefix == "osd pool create-virtual") {
+    string poolstr, basestr;
+    cmd_getval(cmdmap, "pool", poolstr);
+    cmd_getval(cmdmap, "base", basestr);
+    int64_t base = osdmap.lookup_pg_pool_name(basestr);
+    if (base < 0) {
+      ss << "unrecognized pool '" << basestr << "'";
+      err = -ENOENT;
+      goto reply_no_propose;
+    }
+    if (osdmap.lookup_pg_pool_name(poolstr) >= 0) {
+      ss << "pool '" << poolstr << "' already exists";
+      err = -EEXIST;
+      goto reply_no_propose;
+    }
+    if (int64_t id = osdmap.lookup_vpool_name(poolstr); id >= 0) {
+      if (osdmap.get_vpool_base(id) == base) {
+	ss << "virtual pool '" << poolstr << "' already exists";
+	err = 0;
+      } else {
+	ss << "virtual pool '" << poolstr << "' already exists on another pool";
+	err = -EEXIST;
+      }
+      goto reply_no_propose;
+    }
+    for (auto& [id, vp] : pending_inc.new_vpools) {
+      if (vp.second == poolstr) {
+	goto wait;
+      }
+    }
+    // ids come from the same space as pool ids
+    if (pending_inc.new_pool_max == -1) {
+      pending_inc.new_pool_max = osdmap.pool_max;
+    }
+    int64_t id = ++pending_inc.new_pool_max;
+    pending_inc.new_vpools[id] = {base, poolstr};
+    ss << "virtual pool '" << poolstr << "' created with id " << id
+       << " on pool '" << basestr << "'";
+    getline(ss, rs);
+    wait_for_commit(op, new Monitor::C_Command(mon, op, 0, rs,
+					      get_last_committed() + 1));
+    return true;
+
+  } else if (prefix == "osd pool rm-virtual") {
+    string poolstr;
+    cmd_getval(cmdmap, "pool", poolstr);
+    int64_t id = osdmap.lookup_vpool_name(poolstr);
+    if (id < 0) {
+      ss << "virtual pool '" << poolstr << "' does not exist";
+      err = 0;
+      goto reply_no_propose;
+    }
+    pending_inc.old_vpools.insert(id);
+    ss << "virtual pool '" << poolstr << "' removed";
+    getline(ss, rs);
+    wait_for_commit(op, new Monitor::C_Command(mon, op, 0, rs,
+					      get_last_committed() + 1));
+    return true;
+
   } else if (prefix == "osd pool rename") {
     string srcpoolstr, destpoolstr;
     cmd_getval(cmdmap, "srcpool", srcpoolstr);

@@ -839,6 +839,9 @@ void OSDMap::Incremental::encode(ceph::buffer::list& bl, uint64_t features) cons
     } else if (!HAVE_FEATURE(features, SERVER_REEF)) {
       v = 8;
     }
+    if (v >= 9 && (!new_vpools.empty() || !old_vpools.empty())) {
+      v = 10;
+    }
     ENCODE_START(v, 1, bl); // client-usable data
     encode(fsid, bl);
     encode(epoch, bl);
@@ -900,6 +903,10 @@ void OSDMap::Incremental::encode(ceph::buffer::list& bl, uint64_t features) cons
     if (v >= 9) {
       encode(new_pg_upmap_primary, bl);
       encode(old_pg_upmap_primary, bl);
+    }
+    if (v >= 10) {
+      encode(new_vpools, bl);
+      encode(old_vpools, bl);
     }
     ENCODE_FINISH(bl); // client-usable data
   }
@@ -1131,7 +1138,7 @@ void OSDMap::Incremental::decode(ceph::buffer::list::const_iterator& bl)
     return;
   }
   {
-    DECODE_START(9, bl); // client-usable data
+    DECODE_START(10, bl); // client-usable data
     decode(fsid, bl);
     decode(epoch, bl);
     decode(modified, bl);
@@ -1185,6 +1192,10 @@ void OSDMap::Incremental::decode(ceph::buffer::list::const_iterator& bl)
     if (struct_v >= 9) {
       decode(new_pg_upmap_primary, bl);
       decode(old_pg_upmap_primary, bl);
+    }
+    if (struct_v >= 10) {
+      decode(new_vpools, bl);
+      decode(old_vpools, bl);
     }
     DECODE_FINISH(bl); // client-usable data
   }
@@ -2705,6 +2716,13 @@ int OSDMap::apply_incremental(const Incremental &inc)
     last_in_change = inc.new_last_in_change;
   }
 
+  for (auto id : inc.old_vpools) {
+    vpools.erase(id);
+  }
+  for (auto& [id, vp] : inc.new_vpools) {
+    vpools[id] = vp;
+  }
+
   for (const auto &pname : inc.new_pool_names) {
     auto pool_name_entry = pool_name.find(pname.first);
     if (pool_name_entry != pool_name.end()) {
@@ -3496,6 +3514,16 @@ int64_t OSDMap::lookup_pg_pool_name(std::string_view name) const {
   return p->second;
 }
 
+int64_t OSDMap::lookup_vpool_name(std::string_view name) const
+{
+  for (auto& [id, vp] : vpools) {
+    if (vp.second == name) {
+      return id;
+    }
+  }
+  return -ENOENT;
+}
+
 void OSDMap::_pg_to_up_acting_osds(
   const pg_t& pg, vector<int> *up, int *up_primary,
   vector<int> *acting, int *acting_primary,
@@ -3826,6 +3854,9 @@ void OSDMap::encode(ceph::buffer::list& bl, uint64_t features) const
     } else if (!HAVE_FEATURE(features, SERVER_REEF)) {
       v = 9;
     }
+    if (v >= 10 && !vpools.empty()) {
+      v = 11;
+    }
     ENCODE_START(v, 1, bl); // client-usable data
     // base
     encode(fsid, bl);
@@ -3904,6 +3935,9 @@ void OSDMap::encode(ceph::buffer::list& bl, uint64_t features) const
       encode(pg_upmap_primaries, bl);
     } else {
       ceph_assert(pg_upmap_primaries.empty());
+    }
+    if (v >= 11) {
+      encode(vpools, bl);
     }
     ENCODE_FINISH(bl); // client-usable data
   }
@@ -4168,7 +4202,7 @@ void OSDMap::decode(ceph::buffer::list::const_iterator& bl)
    * Since we made it past that hurdle, we can use our normal paths.
    */
   {
-    DECODE_START(10, bl); // client-usable data
+    DECODE_START(11, bl); // client-usable data
     // base
     decode(fsid, bl);
     decode(epoch, bl);
@@ -4249,6 +4283,11 @@ void OSDMap::decode(ceph::buffer::list::const_iterator& bl)
       decode(pg_upmap_primaries, bl);
     } else {
       pg_upmap_primaries.clear();
+    }
+    if (struct_v >= 11) {
+      decode(vpools, bl);
+    } else {
+      vpools.clear();
     }
     DECODE_FINISH(bl); // client-usable data
   }
@@ -4547,6 +4586,16 @@ void OSDMap::dump(Formatter *f, CephContext *cct,
   f->dump_stream("fsid") << get_fsid();
   f->dump_stream("created") << get_created();
   f->dump_stream("modified") << get_modified();
+  f->open_array_section("virtual_pools");
+  for (auto& [id, vp] : vpools) {
+    f->open_object_section("virtual_pool");
+    f->dump_int("pool", id);
+    f->dump_string("pool_name", vp.second);
+    f->dump_int("base_pool", vp.first);
+    f->dump_string("namespace_prefix", vpool_nspace_prefix(id));
+    f->close_section();
+  }
+  f->close_section();
   f->dump_stream("last_up_change") << last_up_change;
   f->dump_stream("last_in_change") << last_in_change;
   f->dump_string("flags", get_flag_string());

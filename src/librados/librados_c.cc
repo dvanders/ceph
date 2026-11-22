@@ -2365,6 +2365,13 @@ extern "C" int LIBRADOS_C_API_DEFAULT_F(rados_nobjects_list_open)(
   h->pool_id = ctx->poolid;
   h->pool_snap_seq = ctx->snap_seq;
   h->nspace = ctx->oloc.nspace;	// After dropping compatibility need nspace
+  ctx->objecter->with_osdmap([&](const OSDMap& o) {
+    // a virtual pool is listed as a namespace of its base pool
+    if (int64_t base = o.get_vpool_base(ctx->poolid); base >= 0) {
+      h->pool_id = base;
+      h->nspace = OSDMap::vpool_nspace_prefix(ctx->poolid) + ctx->oloc.nspace;
+    }
+  });
   *listh = (void *)new librados::ObjListCtx(ctx, h);
   tracepoint(librados, rados_nobjects_list_open_exit, 0, *listh);
   return 0;

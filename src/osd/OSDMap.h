@@ -369,6 +369,9 @@ public:
     mempool::osdmap::map<pg_t,mempool::osdmap::vector<int32_t>> new_pg_upmap;
     mempool::osdmap::map<pg_t,mempool::osdmap::vector<std::pair<int32_t,int32_t>>> new_pg_upmap_items;
     mempool::osdmap::map<pg_t, int32_t> new_pg_upmap_primary;
+    /// virtual pools: id -> (base pool, name)
+    std::map<int64_t, std::pair<int64_t, std::string>> new_vpools;
+    std::set<int64_t> old_vpools;
     mempool::osdmap::set<pg_t> old_pg_upmap, old_pg_upmap_items, old_pg_upmap_primary;
     mempool::osdmap::map<int64_t, snap_interval_set_t> new_removed_snaps;
     mempool::osdmap::map<int64_t, snap_interval_set_t> new_purged_snaps;
@@ -542,6 +545,13 @@ private:
   mempool::osdmap::map<pg_t,mempool::osdmap::vector<int32_t>> pg_upmap; ///< remap pg
   mempool::osdmap::map<pg_t,mempool::osdmap::vector<std::pair<int32_t,int32_t>>> pg_upmap_items; ///< remap osds in up set
   mempool::osdmap::map<pg_t, int32_t> pg_upmap_primaries; ///< remap primary of a pg
+
+  /**
+   * Virtual pools (prototype). A virtual pool has an id and a name like a
+   * pool, but no PGs: its objects live in its base pool, in namespaces
+   * that start with vpool_nspace_prefix(id). id -> (base pool, name).
+   */
+  std::map<int64_t, std::pair<int64_t, std::string>> vpools;
 
   mempool::osdmap::map<int64_t,pg_pool_t> pools;
   mempool::osdmap::map<int64_t,std::string> pool_name;
@@ -1256,6 +1266,27 @@ public:
   }
 
   int64_t lookup_pg_pool_name(std::string_view name) const;
+
+  // -- virtual pools --
+  const std::map<int64_t, std::pair<int64_t, std::string>>& get_vpools() const {
+    return vpools;
+  }
+  /// id of the virtual pool of that name, or -ENOENT
+  int64_t lookup_vpool_name(std::string_view name) const;
+  /// base pool of a virtual pool, or -1 if id is not a virtual pool
+  int64_t get_vpool_base(int64_t id) const {
+    auto p = vpools.find(id);
+    return p == vpools.end() ? -1 : p->second.first;
+  }
+  /// prefix of the namespace of every object of a virtual pool
+  static std::string vpool_nspace_prefix(int64_t id) {
+    return "vpool." + std::to_string(id) + "/";
+  }
+  /// the pool that holds the objects: the base pool for a virtual pool
+  int64_t get_data_pool(int64_t id) const {
+    int64_t base = get_vpool_base(id);
+    return base >= 0 ? base : id;
+  }
 
   int64_t get_pool_max() const {
     return pool_max;

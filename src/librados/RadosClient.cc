@@ -89,6 +89,11 @@ int64_t librados::RadosClient::lookup_pool(const char *name)
     ret = objecter->with_osdmap(std::mem_fn(&OSDMap::lookup_pg_pool_name),
                                  name);
   }
+  if (-ENOENT == ret) {
+    // a virtual pool has an id, but no PGs of its own
+    ret = objecter->with_osdmap(std::mem_fn(&OSDMap::lookup_vpool_name),
+				name);
+  }
 
   return ret;
 }
@@ -118,7 +123,8 @@ int librados::RadosClient::pool_requires_alignment2(int64_t pool_id,
     return r;
   }
 
-  return objecter->with_osdmap([req, pool_id](const OSDMap& o) {
+  return objecter->with_osdmap([req, pool_id](const OSDMap& o) mutable {
+      pool_id = o.get_data_pool(pool_id);
       if (!o.have_pg_pool(pool_id)) {
 	return -ENOENT;
       }
@@ -150,7 +156,8 @@ int librados::RadosClient::pool_required_alignment2(int64_t pool_id,
     return r;
   }
 
-  return objecter->with_osdmap([alignment, pool_id](const OSDMap &o) {
+  return objecter->with_osdmap([alignment, pool_id](const OSDMap &o) mutable {
+      pool_id = o.get_data_pool(pool_id);
       if (!o.have_pg_pool(pool_id)) {
 	return -ENOENT;
       }
@@ -166,7 +173,10 @@ int librados::RadosClient::pool_get_name(uint64_t pool_id, std::string *s, bool 
     return r;
   retry:
   objecter->with_osdmap([&](const OSDMap& o) {
-      if (!o.have_pg_pool(pool_id)) {
+      if (auto vp = o.get_vpools().find(pool_id); vp != o.get_vpools().end()) {
+	r = 0;
+	*s = vp->second.second;
+      } else if (!o.have_pg_pool(pool_id)) {
 	r = -ENOENT;
       } else {
 	r = 0;

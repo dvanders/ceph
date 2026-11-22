@@ -3115,7 +3115,9 @@ bool Objecter::is_pg_changed(
 
 bool Objecter::target_should_be_paused(op_target_t *t)
 {
-  const pg_pool_t *pi = osdmap->get_pg_pool(t->base_oloc.pool);
+  // the base pool, for a virtual pool
+  const pg_pool_t *pi = osdmap->get_pg_pool(
+    osdmap->get_data_pool(t->base_oloc.pool));
   bool pauserd = osdmap->test_flag(CEPH_OSDMAP_PAUSERD);
   bool pausewr = osdmap->test_flag(CEPH_OSDMAP_PAUSEWR);
   // Not only writes: an RWORDERED read must wait behind the writes that a
@@ -3256,7 +3258,10 @@ int Objecter::_calc_target(op_target_t *t, snapid_t snap, bool any_change)
 		<< (is_write ? " is_write" : "")
 		<< dendl;
 
-  const pg_pool_t *pi = osdmap->get_pg_pool(t->base_oloc.pool);
+  // a virtual pool is a namespace of its base pool
+  const int64_t vpool_base = osdmap->get_vpool_base(t->base_oloc.pool);
+  const pg_pool_t *pi = osdmap->get_pg_pool(
+    vpool_base >= 0 ? vpool_base : t->base_oloc.pool);
   if (!pi) {
     t->osd = -1;
     return RECALC_OP_TARGET_POOL_DNE;
@@ -3282,6 +3287,11 @@ int Objecter::_calc_target(op_target_t *t, snapid_t snap, bool any_change)
   // apply tiering
   t->target_oid = t->base_oid;
   t->target_oloc = t->base_oloc;
+  if (vpool_base >= 0) {
+    t->target_oloc.pool = vpool_base;
+    t->target_oloc.nspace =
+      OSDMap::vpool_nspace_prefix(t->base_oloc.pool) + t->base_oloc.nspace;
+  }
   if ((t->flags & CEPH_OSD_FLAG_IGNORE_OVERLAY) == 0) {
     if (is_read && pi->has_read_tier())
       t->target_oloc.pool = pi->read_tier;
@@ -4881,6 +4891,7 @@ void Objecter::allocate_selfmanaged_snap(
   asio::any_completion_handler<void(bs::error_code, snapid_t)> onfinish)
 {
   unique_lock wl(rwlock);
+  pool = osdmap->get_data_pool(pool);  // a virtual pool uses its base pool's snaps
   ldout(cct, 10) << "allocate_selfmanaged_snap; pool: " << pool << dendl;
   auto op = new PoolOp;
   op->tid = ++last_tid;
@@ -4935,6 +4946,7 @@ void Objecter::delete_selfmanaged_snap(int64_t pool, snapid_t snap,
 				       decltype(PoolOp::onfinish)&& onfinish)
 {
   unique_lock wl(rwlock);
+  pool = osdmap->get_data_pool(pool);  // a virtual pool uses its base pool's snaps
   ldout(cct, 10) << "delete_selfmanaged_snap; pool: " << pool << "; snap: "
 		 << snap << dendl;
   auto op = new PoolOp;

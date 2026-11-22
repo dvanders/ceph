@@ -1244,6 +1244,15 @@ COMMAND("osd pool rm "
 	"name=yes_i_really_really_mean_it_not_faking,type=CephBool,req=false ",
 	"remove pool",
 	"osd", "rw")
+COMMAND("osd pool create-virtual "
+	"name=pool,type=CephPoolname "
+	"name=base,type=CephPoolname",
+	"create virtual pool <pool>: a namespace of pool <base> that shares its PGs (prototype)",
+	"osd", "rw")
+COMMAND("osd pool rm-virtual "
+	"name=pool,type=CephPoolname",
+	"remove virtual pool <pool> (its objects stay in the base pool; prototype)",
+	"osd", "rw")
 COMMAND("osd pool rename "
 	"name=srcpool,type=CephPoolname "
 	"name=destpool,type=CephPoolname "
