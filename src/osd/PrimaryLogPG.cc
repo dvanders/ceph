@@ -9559,9 +9559,11 @@ int PrimaryLogPG::prepare_transaction(OpContext *ctx)
   }
 
   // check for full
+  const bool vpool_full = get_osdmap()->has_vpool_full() &&
+    get_osdmap()->is_vpool_full(OSDMap::vpool_from_nspace(ctx->obs->oi.soid.nspace));
   if ((ctx->delta_stats.num_bytes > 0 ||
        ctx->delta_stats.num_objects > 0) &&  // FIXME: keys?
-      pool.info.has_flag(pg_pool_t::FLAG_FULL)) {
+      (pool.info.has_flag(pg_pool_t::FLAG_FULL) || vpool_full)) {
     auto m = ctx->op->get_req<MOSDOp>();
     if (ctx->reqid.name.is_mds() ||   // FIXME: ignore MDS for now
 	m->has_flag(CEPH_OSD_FLAG_FULL_FORCE)) {
@@ -9570,7 +9572,8 @@ int PrimaryLogPG::prepare_transaction(OpContext *ctx)
     } else if (m->has_flag(CEPH_OSD_FLAG_FULL_TRY)) {
       // they tried, they failed.
       dout(20) << __func__ << " full, replying to FULL_TRY op" << dendl;
-      return pool.info.has_flag(pg_pool_t::FLAG_FULL_QUOTA) ? -EDQUOT : -ENOSPC;
+      return (vpool_full || pool.info.has_flag(pg_pool_t::FLAG_FULL_QUOTA)) ?
+	-EDQUOT : -ENOSPC;
     } else {
       // drop request
       dout(20) << __func__ << " full, dropping request (bad client)" << dendl;

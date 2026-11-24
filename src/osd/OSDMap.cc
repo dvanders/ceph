@@ -839,7 +839,8 @@ void OSDMap::Incremental::encode(ceph::buffer::list& bl, uint64_t features) cons
     } else if (!HAVE_FEATURE(features, SERVER_REEF)) {
       v = 8;
     }
-    if (v >= 9 && (!new_vpools.empty() || !old_vpools.empty())) {
+    if (v >= 9 && (!new_vpools.empty() || !old_vpools.empty() ||
+		   !new_vpool_quotas.empty() || !new_vpool_full.empty())) {
       v = 10;
     }
     ENCODE_START(v, 1, bl); // client-usable data
@@ -907,6 +908,8 @@ void OSDMap::Incremental::encode(ceph::buffer::list& bl, uint64_t features) cons
     if (v >= 10) {
       encode(new_vpools, bl);
       encode(old_vpools, bl);
+      encode(new_vpool_quotas, bl);
+      encode(new_vpool_full, bl);
     }
     ENCODE_FINISH(bl); // client-usable data
   }
@@ -1196,6 +1199,8 @@ void OSDMap::Incremental::decode(ceph::buffer::list::const_iterator& bl)
     if (struct_v >= 10) {
       decode(new_vpools, bl);
       decode(old_vpools, bl);
+      decode(new_vpool_quotas, bl);
+      decode(new_vpool_full, bl);
     }
     DECODE_FINISH(bl); // client-usable data
   }
@@ -2718,9 +2723,28 @@ int OSDMap::apply_incremental(const Incremental &inc)
 
   for (auto id : inc.old_vpools) {
     vpools.erase(id);
+    vpool_quotas.erase(id);
+    vpools_full.erase(id);
   }
   for (auto& [id, vp] : inc.new_vpools) {
     vpools[id] = vp;
+  }
+  for (auto& [id, q] : inc.new_vpool_quotas) {
+    if (!vpools.count(id)) {
+      continue;
+    }
+    if (q.first == 0 && q.second == 0) {
+      vpool_quotas.erase(id);
+    } else {
+      vpool_quotas[id] = q;
+    }
+  }
+  for (auto& [id, full] : inc.new_vpool_full) {
+    if (full && vpools.count(id)) {
+      vpools_full.insert(id);
+    } else {
+      vpools_full.erase(id);
+    }
   }
 
   for (const auto &pname : inc.new_pool_names) {
@@ -3938,6 +3962,8 @@ void OSDMap::encode(ceph::buffer::list& bl, uint64_t features) const
     }
     if (v >= 11) {
       encode(vpools, bl);
+      encode(vpool_quotas, bl);
+      encode(vpools_full, bl);
     }
     ENCODE_FINISH(bl); // client-usable data
   }
@@ -4286,8 +4312,12 @@ void OSDMap::decode(ceph::buffer::list::const_iterator& bl)
     }
     if (struct_v >= 11) {
       decode(vpools, bl);
+      decode(vpool_quotas, bl);
+      decode(vpools_full, bl);
     } else {
       vpools.clear();
+      vpool_quotas.clear();
+      vpools_full.clear();
     }
     DECODE_FINISH(bl); // client-usable data
   }
@@ -4593,6 +4623,10 @@ void OSDMap::dump(Formatter *f, CephContext *cct,
     f->dump_string("pool_name", vp.second);
     f->dump_int("base_pool", vp.first);
     f->dump_string("namespace_prefix", vpool_nspace_prefix(id));
+    auto quota = get_vpool_quota(id);
+    f->dump_unsigned("quota_max_objects", quota.first);
+    f->dump_unsigned("quota_max_bytes", quota.second);
+    f->dump_bool("full_quota", is_vpool_full(id));
     f->close_section();
   }
   f->close_section();

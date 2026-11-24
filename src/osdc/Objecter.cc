@@ -1347,6 +1347,8 @@ void Objecter::handle_osd_map(MOSDMap *m)
   for (auto it = osdmap->get_pools().begin();
        it != osdmap->get_pools().end(); ++it)
     pool_full_map[it->first] = _osdmap_pool_full(it->second);
+  for (auto& [id, vp] : osdmap->get_vpools())
+    pool_full_map[id] = _osdmap_pool_full(id);
 
   list<LingerOp*> need_resend_linger;
   map<ceph_tid_t, Op*> need_resend;
@@ -3123,7 +3125,8 @@ bool Objecter::target_should_be_paused(op_target_t *t)
   // Not only writes: an RWORDERED read must wait behind the writes that a
   // full pool pauses.
   bool pausefull = t->respects_full() &&
-    (_osdmap_full_flag() || _osdmap_pool_full(*pi));
+    (_osdmap_full_flag() || _osdmap_pool_full(*pi) ||
+     (honor_pool_full && osdmap->is_vpool_full(t->base_oloc.pool)));
 
   return (t->flags & CEPH_OSD_FLAG_READ && pauserd) ||
     (t->flags & CEPH_OSD_FLAG_WRITE && pausewr) ||
@@ -3154,7 +3157,11 @@ bool Objecter::osdmap_pool_full(const int64_t pool_id) const
 
 bool Objecter::_osdmap_pool_full(const int64_t pool_id) const
 {
-  const pg_pool_t *pool = osdmap->get_pg_pool(pool_id);
+  // a virtual pool is full if it is over its quota or its base pool is full
+  if (honor_pool_full && osdmap->is_vpool_full(pool_id)) {
+    return true;
+  }
+  const pg_pool_t *pool = osdmap->get_pg_pool(osdmap->get_data_pool(pool_id));
   if (pool == NULL) {
     ldout(cct, 4) << __func__ << ": DNE pool " << pool_id << dendl;
     return false;
@@ -3170,7 +3177,7 @@ bool Objecter::_osdmap_has_pool_full() const
     if (_osdmap_pool_full(it->second))
       return true;
   }
-  return false;
+  return honor_pool_full && osdmap->has_vpool_full();
 }
 
 /**
@@ -3193,6 +3200,9 @@ void Objecter::update_pool_full_map(map<int64_t, bool>& pool_full_map)
       pool_full_map[it->first] = _osdmap_pool_full(it->second) ||
 	pool_full_map[it->first];
     }
+  }
+  for (auto& [id, vp] : osdmap->get_vpools()) {
+    pool_full_map[id] = _osdmap_pool_full(id) || pool_full_map[id];
   }
 }
 

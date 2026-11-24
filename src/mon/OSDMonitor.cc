@@ -8087,6 +8087,35 @@ bool OSDMonitor::update_pools_status()
       ret = true;
     }
   }
+
+  // virtual pools: what they hold is summed from the PGs of the base pool
+  auto& vpool_sum = mon.mgrstatmon()->get_digest().vpool_sum;
+  for (auto& [id, vp] : osdmap.get_vpools()) {
+    auto [max_objects, max_bytes] = osdmap.get_vpool_quota(id);
+    int64_t objects = 0, bytes = 0;
+    if (auto p = vpool_sum.find(id); p != vpool_sum.end()) {
+      objects = std::max<int64_t>(p->second.first, 0);
+      bytes = std::max<int64_t>(p->second.second, 0);
+    }
+    bool full =
+      (max_bytes > 0 && (uint64_t)bytes >= max_bytes) ||
+      (max_objects > 0 && (uint64_t)objects >= max_objects);
+    if (full == osdmap.is_vpool_full(id) ||
+	pending_inc.new_vpool_full.count(id)) {
+      continue;
+    }
+    if (full) {
+      mon.clog->warn() << "virtual pool '" << vp.second << "' is full"
+		       << " (" << objects << " objects, " << byte_u_t(bytes)
+		       << "; quota max_objects " << max_objects
+		       << ", max_bytes " << byte_u_t(max_bytes) << ")";
+    } else {
+      mon.clog->info() << "virtual pool '" << vp.second
+		       << "' no longer out of quota";
+    }
+    pending_inc.new_vpool_full[id] = full;
+    ret = true;
+  }
   return ret;
 }
 
@@ -17600,7 +17629,8 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
     string poolstr;
     cmd_getval(cmdmap, "pool", poolstr);
     int64_t pool_id = osdmap.lookup_pg_pool_name(poolstr);
-    if (pool_id < 0) {
+    int64_t vpool_id = pool_id < 0 ? osdmap.lookup_vpool_name(poolstr) : -1;
+    if (pool_id < 0 && vpool_id < 0) {
       ss << "unrecognized pool '" << poolstr << "'";
       err = -ENOENT;
       goto reply_no_propose;
@@ -17632,13 +17662,25 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       goto reply_no_propose;
     }
 
-    pg_pool_t *pi = pending_inc.get_new_pool(pool_id, osdmap.get_pg_pool(pool_id));
-    if (field == "max_objects") {
-      pi->quota_max_objects = value;
-    } else if (field == "max_bytes") {
-      pi->quota_max_bytes = value;
+    if (vpool_id >= 0) {
+      auto p = pending_inc.new_vpool_quotas.find(vpool_id);
+      auto quota = p != pending_inc.new_vpool_quotas.end() ?
+	p->second : osdmap.get_vpool_quota(vpool_id);
+      if (field == "max_objects") {
+	quota.first = value;
+      } else {
+	quota.second = value;
+      }
+      pending_inc.new_vpool_quotas[vpool_id] = quota;
     } else {
-      ceph_abort_msg("unrecognized option");
+      pg_pool_t *pi = pending_inc.get_new_pool(pool_id, osdmap.get_pg_pool(pool_id));
+      if (field == "max_objects") {
+	pi->quota_max_objects = value;
+      } else if (field == "max_bytes") {
+	pi->quota_max_bytes = value;
+      } else {
+	ceph_abort_msg("unrecognized option");
+      }
     }
     ss << "set-quota " << field << " = " << value << " for pool " << poolstr;
     rs = ss.str();

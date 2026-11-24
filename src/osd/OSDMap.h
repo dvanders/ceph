@@ -372,6 +372,10 @@ public:
     /// virtual pools: id -> (base pool, name)
     std::map<int64_t, std::pair<int64_t, std::string>> new_vpools;
     std::set<int64_t> old_vpools;
+    /// virtual pool quotas: id -> (max objects, max bytes), 0 = no limit
+    std::map<int64_t, std::pair<uint64_t, uint64_t>> new_vpool_quotas;
+    /// virtual pools that went over or came back under their quota
+    std::map<int64_t, bool> new_vpool_full;
     mempool::osdmap::set<pg_t> old_pg_upmap, old_pg_upmap_items, old_pg_upmap_primary;
     mempool::osdmap::map<int64_t, snap_interval_set_t> new_removed_snaps;
     mempool::osdmap::map<int64_t, snap_interval_set_t> new_purged_snaps;
@@ -552,6 +556,10 @@ private:
    * that start with vpool_nspace_prefix(id). id -> (base pool, name).
    */
   std::map<int64_t, std::pair<int64_t, std::string>> vpools;
+  /// id -> (max objects, max bytes); 0 = no limit
+  std::map<int64_t, std::pair<uint64_t, uint64_t>> vpool_quotas;
+  /// virtual pools that are over their quota: writes to them are refused
+  std::set<int64_t> vpools_full;
 
   mempool::osdmap::map<int64_t,pg_pool_t> pools;
   mempool::osdmap::map<int64_t,std::string> pool_name;
@@ -1277,6 +1285,16 @@ public:
   int64_t get_vpool_base(int64_t id) const {
     auto p = vpools.find(id);
     return p == vpools.end() ? -1 : p->second.first;
+  }
+  std::pair<uint64_t, uint64_t> get_vpool_quota(int64_t id) const {
+    auto p = vpool_quotas.find(id);
+    return p == vpool_quotas.end() ? std::pair<uint64_t, uint64_t>{0, 0} : p->second;
+  }
+  bool is_vpool_full(int64_t id) const {
+    return vpools_full.count(id);
+  }
+  bool has_vpool_full() const {
+    return !vpools_full.empty();
   }
   /// prefix of the namespace of every object of a virtual pool
   static std::string vpool_nspace_prefix(int64_t id) {
