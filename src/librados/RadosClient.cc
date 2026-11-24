@@ -628,6 +628,11 @@ int librados::RadosClient::pool_list(std::list<std::pair<int64_t, string> >& v)
           continue;
  v.push_back(std::make_pair(p.first, o.get_pool_name(p.first)));
       }
+      // virtual pools are pools to a client (librbd looks for the children
+      // of an image in every pool that is listed)
+      for (auto& [id, vp] : o.get_vpools()) {
+	v.push_back(std::make_pair(id, vp.second));
+      }
     });
   return 0;
 }
@@ -752,6 +757,10 @@ int librados::RadosClient::pool_get_base_tier(int64_t pool_id, int64_t* base_tie
 	} else {
 	  *base_tier = pool->tier_of;
 	}
+	r = 0;
+      } else if (o.get_vpool_base(pool_id) >= 0) {
+	// a virtual pool is not a tier of its base pool
+	*base_tier = pool_id;
 	r = 0;
       } else {
 	r = -ENOENT;
