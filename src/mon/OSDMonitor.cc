@@ -7304,6 +7304,47 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
     cmd_getval(cmdmap, "pool", pool_name);
 
     int64_t poolid = osdmap.lookup_pg_pool_name(pool_name);
+    if (int64_t vid = osdmap.lookup_vpool_name(pool_name);
+	poolid < 0 && vid >= 0) {
+      // a virtual pool: what it holds is summed from the PGs of its base pool
+      auto [max_objects, max_bytes] = osdmap.get_vpool_quota(vid);
+      int64_t objects = 0, bytes = 0;
+      auto& sums = mon.mgrstatmon()->get_digest().vpool_sum;
+      if (auto q = sums.find(vid); q != sums.end()) {
+	objects = std::max<int64_t>(q->second.first, 0);
+	bytes = std::max<int64_t>(q->second.second, 0);
+      }
+      if (f) {
+	f->open_object_section("pool_quotas");
+	f->dump_string("pool_name", pool_name);
+	f->dump_unsigned("pool_id", vid);
+	f->dump_unsigned("quota_max_objects", max_objects);
+	f->dump_int("current_num_objects", objects);
+	f->dump_unsigned("quota_max_bytes", max_bytes);
+	f->dump_int("current_num_bytes", bytes);
+	f->close_section();
+	f->flush(rdata);
+      } else {
+	stringstream rs;
+	rs << "quotas for virtual pool '" << pool_name << "':\n"
+	   << "  max objects: ";
+	if (max_objects == 0)
+	  rs << "N/A";
+	else
+	  rs << si_u_t(max_objects) << " objects  (current num objects: "
+	     << objects << " objects)";
+	rs << "\n  max bytes  : ";
+	if (max_bytes == 0)
+	  rs << "N/A";
+	else
+	  rs << byte_u_t(max_bytes) << "  (current num bytes: "
+	     << bytes << " bytes)";
+	rdata.append(rs.str());
+      }
+      rdata.append("\n");
+      r = 0;
+      goto reply;
+    }
     if (poolid < 0) {
       ceph_assert(poolid == -ENOENT);
       ss << "unrecognized pool '" << pool_name << "'";

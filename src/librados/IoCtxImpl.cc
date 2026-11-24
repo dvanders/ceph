@@ -535,18 +535,48 @@ int librados::IoCtxImpl::nlist(Objecter::NListContext *context, int max_entries)
 
   context->max_entries = max_entries;
   context->nspace = oloc.nspace;
+  // a virtual pool is listed as a namespace of its base pool
+  std::string vpool_prefix;
+  bool vpool_all = false;
   objecter->with_osdmap([&](const OSDMap& o) {
-    // a virtual pool is listed as a namespace of its base pool
     if (o.get_vpool_base(poolid) >= 0) {
-      context->nspace = OSDMap::vpool_nspace_prefix(poolid) + oloc.nspace;
+      vpool_prefix = OSDMap::vpool_nspace_prefix(poolid);
+      if (oloc.nspace == "\001") {
+	// all namespaces of the virtual pool: there is no listing by
+	// prefix, so list all of the base pool and drop the rest here
+	vpool_all = true;
+      } else {
+	context->nspace = vpool_prefix + oloc.nspace;
+      }
     }
   });
 
-  objecter->list_nobjects(context, new C_SafeCond(mylock, cond, &done, &r));
-
-  std::unique_lock l{mylock};
-  cond.wait(l, [&done] { return done; });
-  return r;
+  const size_t had = context->list.size();
+  for (;;) {
+    done = false;
+    objecter->list_nobjects(context, new C_SafeCond(mylock, cond, &done, &r));
+    {
+      std::unique_lock l{mylock};
+      cond.wait(l, [&done] { return done; });
+    }
+    if (r < 0 || vpool_prefix.empty()) {
+      return r;
+    }
+    // the caller sees the namespaces without the prefix
+    auto p = context->list.begin();
+    std::advance(p, std::min(had, context->list.size()));
+    while (p != context->list.end()) {
+      if (p->nspace.compare(0, vpool_prefix.size(), vpool_prefix) != 0) {
+	p = context->list.erase(p);
+      } else {
+	p->nspace.erase(0, vpool_prefix.size());
+	++p;
+      }
+    }
+    if (!vpool_all || context->list.size() > had || context->at_end()) {
+      return r;
+    }
+  }
 }
 
 uint32_t librados::IoCtxImpl::nlist_seek(Objecter::NListContext *context,

@@ -8616,6 +8616,12 @@ void OSDMap::check_health(CephContext *cct,
         nearfull_detail.push_back(ss.str());
       }
     }
+    for (auto id : vpools_full) {
+      if (auto p = vpools.find(id); p != vpools.end()) {
+	full_detail.push_back("virtual pool '" + p->second.second +
+			      "' is full (running out of quota)");
+      }
+    }
     if (!full_detail.empty()) {
       ostringstream ss;
       ss << full_detail.size() << " pool(s) full";
