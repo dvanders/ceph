@@ -349,6 +349,29 @@ public:
   }
 };
 
+class PGVpoolPurge : public PGOpQueueable {
+  epoch_t epoch_queued;
+public:
+  PGVpoolPurge(
+    spg_t pg,
+    epoch_t epoch_queued)
+    : PGOpQueueable(pg), epoch_queued(epoch_queued) {}
+  std::ostream &print(std::ostream &rhs) const final {
+    return rhs << "PGVpoolPurge(pgid=" << get_pgid()
+	       << " epoch_queued=" << epoch_queued
+	       << ")";
+  }
+  std::string print() const final {
+    return fmt::format(
+	"PGVpoolPurge(pgid={} epoch_queued={})", get_pgid(), epoch_queued);
+  }
+  void run(
+    OSD *osd, OSDShard *sdata, PGRef& pg, ThreadPool::TPHandle &handle) final;
+  SchedulerClass get_scheduler_class() const final {
+    return SchedulerClass::background_best_effort;
+  }
+};
+
 class PGScrub : public PGOpQueueable {
   epoch_t epoch_queued;
 public:

@@ -726,6 +726,7 @@ public:
   virtual int get_cache_obj_count() = 0;
 
   virtual void snap_trimmer(epoch_t epoch_queued) = 0;
+  virtual void vpool_purge(epoch_t epoch_queued) = 0;
   virtual void do_command(
     std::string_view prefix,
     const cmdmap_t& cmdmap,
@@ -1400,6 +1401,8 @@ protected:
   void filter_snapc(std::vector<snapid_t> &snaps);
 
   virtual void kick_snap_trim() = 0;
+  /// delete the objects of removed virtual pools, if there are any
+  virtual void kick_vpool_purge() = 0;
   virtual void snap_trimmer_scrub_complete() = 0;
 
   void queue_recovery();

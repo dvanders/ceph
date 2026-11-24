@@ -840,7 +840,8 @@ void OSDMap::Incremental::encode(ceph::buffer::list& bl, uint64_t features) cons
       v = 8;
     }
     if (v >= 9 && (!new_vpools.empty() || !old_vpools.empty() ||
-		   !new_vpool_quotas.empty() || !new_vpool_full.empty())) {
+		   !new_vpool_quotas.empty() || !new_vpool_full.empty() ||
+		   !new_vpools_purging.empty() || !old_vpools_purging.empty())) {
       v = 10;
     }
     ENCODE_START(v, 1, bl); // client-usable data
@@ -910,6 +911,8 @@ void OSDMap::Incremental::encode(ceph::buffer::list& bl, uint64_t features) cons
       encode(old_vpools, bl);
       encode(new_vpool_quotas, bl);
       encode(new_vpool_full, bl);
+      encode(new_vpools_purging, bl);
+      encode(old_vpools_purging, bl);
     }
     ENCODE_FINISH(bl); // client-usable data
   }
@@ -1201,6 +1204,8 @@ void OSDMap::Incremental::decode(ceph::buffer::list::const_iterator& bl)
       decode(old_vpools, bl);
       decode(new_vpool_quotas, bl);
       decode(new_vpool_full, bl);
+      decode(new_vpools_purging, bl);
+      decode(old_vpools_purging, bl);
     }
     DECODE_FINISH(bl); // client-usable data
   }
@@ -2739,6 +2744,12 @@ int OSDMap::apply_incremental(const Incremental &inc)
       vpool_quotas[id] = q;
     }
   }
+  for (auto id : inc.old_vpools_purging) {
+    vpools_purging.erase(id);
+  }
+  for (auto& [id, vp] : inc.new_vpools_purging) {
+    vpools_purging[id] = vp;
+  }
   for (auto& [id, full] : inc.new_vpool_full) {
     if (full && vpools.count(id)) {
       vpools_full.insert(id);
@@ -3878,7 +3889,7 @@ void OSDMap::encode(ceph::buffer::list& bl, uint64_t features) const
     } else if (!HAVE_FEATURE(features, SERVER_REEF)) {
       v = 9;
     }
-    if (v >= 10 && !vpools.empty()) {
+    if (v >= 10 && (!vpools.empty() || !vpools_purging.empty())) {
       v = 11;
     }
     ENCODE_START(v, 1, bl); // client-usable data
@@ -3964,6 +3975,7 @@ void OSDMap::encode(ceph::buffer::list& bl, uint64_t features) const
       encode(vpools, bl);
       encode(vpool_quotas, bl);
       encode(vpools_full, bl);
+      encode(vpools_purging, bl);
     }
     ENCODE_FINISH(bl); // client-usable data
   }
@@ -4314,7 +4326,9 @@ void OSDMap::decode(ceph::buffer::list::const_iterator& bl)
       decode(vpools, bl);
       decode(vpool_quotas, bl);
       decode(vpools_full, bl);
+      decode(vpools_purging, bl);
     } else {
+      vpools_purging.clear();
       vpools.clear();
       vpool_quotas.clear();
       vpools_full.clear();
@@ -4627,6 +4641,15 @@ void OSDMap::dump(Formatter *f, CephContext *cct,
     f->dump_unsigned("quota_max_objects", quota.first);
     f->dump_unsigned("quota_max_bytes", quota.second);
     f->dump_bool("full_quota", is_vpool_full(id));
+    f->close_section();
+  }
+  f->close_section();
+  f->open_array_section("virtual_pools_purging");
+  for (auto& [id, vp] : vpools_purging) {
+    f->open_object_section("virtual_pool");
+    f->dump_int("pool", id);
+    f->dump_int("base_pool", vp.first);
+    f->dump_unsigned("removed_epoch", vp.second);
     f->close_section();
   }
   f->close_section();

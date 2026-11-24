@@ -60,6 +60,9 @@ public:
   mempool::pgmap::unordered_map<int32_t,pool_stat_t> pg_pool_sum;
   /// usage of virtual pools: id -> (objects, bytes), summed over PGs
   std::map<int64_t, std::pair<int64_t, int64_t>> vpool_sum;
+  /// base pool -> epoch up to which all of its PGs have purged removed
+  /// virtual pools (only for base pools that have some to purge)
+  std::map<int64_t, epoch_t> vpool_purged_epoch;
   mempool::pgmap::map<int64_t,int64_t> num_pg_by_pool;
   pool_stat_t pg_sum;
   osd_stat_t osd_sum;

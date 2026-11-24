@@ -1501,6 +1501,7 @@ Context* PG::on_clean()
 {
   if (is_active()) {
     kick_snap_trim();
+    kick_vpool_purge();
   }
   m_scrubber->on_primary_active_clean();
   requeue_ops(waiting_for_clean_to_primary_repair,
@@ -1602,6 +1603,7 @@ void PG::on_active_actmap()
   if (recovery_state.is_active()) {
     dout(10) << "Active: kicking snap trim" << dendl;
     kick_snap_trim();
+    kick_vpool_purge();
   }
 
   if (recovery_state.is_peered() &&

@@ -2454,6 +2454,9 @@ struct pg_stat_t {
   /// Signed and not floored: after a split a PG may account for deletes of
   /// objects that its parent counted; only the sum over PGs means something.
   std::map<int64_t, std::pair<int64_t, int64_t>> vpool_stats;
+  /// this PG has deleted the objects of every virtual pool that was
+  /// removed up to this osdmap epoch
+  epoch_t vpool_purged_epoch = 0;
 
   void add_vpool_stats(const pg_stat_t& o, int sign) {
     for (auto& [id, st] : o.vpool_stats) {

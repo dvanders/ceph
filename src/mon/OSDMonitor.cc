@@ -8116,6 +8116,22 @@ bool OSDMonitor::update_pools_status()
     pending_inc.new_vpool_full[id] = full;
     ret = true;
   }
+
+  // removed virtual pools: forget them once every PG of the base pool
+  // has deleted their objects
+  auto& purged = mon.mgrstatmon()->get_digest().vpool_purged_epoch;
+  for (auto& [id, vp] : osdmap.get_vpools_purging()) {
+    if (pending_inc.old_vpools_purging.count(id)) {
+      continue;
+    }
+    auto p = purged.find(vp.first);
+    if (!osdmap.have_pg_pool(vp.first) ||
+	(p != purged.end() && p->second >= vp.second)) {
+      mon.clog->info() << "removed virtual pool " << id << " is purged";
+      pending_inc.old_vpools_purging.insert(id);
+      ret = true;
+    }
+  }
   return ret;
 }
 
@@ -17095,6 +17111,9 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       goto reply_no_propose;
     }
     pending_inc.old_vpools.insert(id);
+    // the PGs of the base pool delete its objects
+    pending_inc.new_vpools_purging[id] = {osdmap.get_vpool_base(id),
+					  pending_inc.epoch};
     ss << "virtual pool '" << poolstr << "' removed";
     getline(ss, rs);
     wait_for_commit(op, new Monitor::C_Command(mon, op, 0, rs,

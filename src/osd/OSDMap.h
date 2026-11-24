@@ -376,6 +376,10 @@ public:
     std::map<int64_t, std::pair<uint64_t, uint64_t>> new_vpool_quotas;
     /// virtual pools that went over or came back under their quota
     std::map<int64_t, bool> new_vpool_full;
+    /// removed virtual pools whose objects are to be deleted:
+    /// id -> (base pool, epoch of removal); and those that are done
+    std::map<int64_t, std::pair<int64_t, epoch_t>> new_vpools_purging;
+    std::set<int64_t> old_vpools_purging;
     mempool::osdmap::set<pg_t> old_pg_upmap, old_pg_upmap_items, old_pg_upmap_primary;
     mempool::osdmap::map<int64_t, snap_interval_set_t> new_removed_snaps;
     mempool::osdmap::map<int64_t, snap_interval_set_t> new_purged_snaps;
@@ -560,6 +564,9 @@ private:
   std::map<int64_t, std::pair<uint64_t, uint64_t>> vpool_quotas;
   /// virtual pools that are over their quota: writes to them are refused
   std::set<int64_t> vpools_full;
+  /// removed virtual pools whose objects the PGs of the base pool still
+  /// have to delete: id -> (base pool, epoch of removal)
+  std::map<int64_t, std::pair<int64_t, epoch_t>> vpools_purging;
 
   mempool::osdmap::map<int64_t,pg_pool_t> pools;
   mempool::osdmap::map<int64_t,std::string> pool_name;
@@ -1285,6 +1292,16 @@ public:
   int64_t get_vpool_base(int64_t id) const {
     auto p = vpools.find(id);
     return p == vpools.end() ? -1 : p->second.first;
+  }
+  const std::map<int64_t, std::pair<int64_t, epoch_t>>& get_vpools_purging() const {
+    return vpools_purging;
+  }
+  /// base pool of a virtual pool, also of one that is being purged; or -1
+  int64_t get_vpool_base_any(int64_t id) const {
+    if (auto p = vpools_purging.find(id); p != vpools_purging.end()) {
+      return p->second.first;
+    }
+    return get_vpool_base(id);
   }
   std::pair<uint64_t, uint64_t> get_vpool_quota(int64_t id) const {
     auto p = vpool_quotas.find(id);

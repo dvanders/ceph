@@ -1709,6 +1709,27 @@ public:
                   OpContextUPtr *ctxp);
   void snap_trimmer(epoch_t e) override;
   void kick_snap_trim() override;
+  void kick_vpool_purge() override;
+  void vpool_purge(epoch_t e) override;
+  /// virtual pools removed after this PG last purged, and the newest of
+  /// their removal epochs
+  epoch_t vpool_purge_wanted(std::set<int64_t> *ids) const;
+  /// record that the objects of the virtual pools ids, removed up to
+  /// epoch, are deleted here
+  void vpool_purge_done(epoch_t epoch, const std::set<int64_t>& ids);
+  struct VpoolPurge {
+    bool queued = false;
+    bool scanning = false;
+    hobject_t cursor;
+    epoch_t target = 0;
+    std::set<int64_t> ids;
+    uint64_t scanned = 0, deleted = 0, skipped = 0;
+    utime_t start;
+    uint64_t gen = 0;		///< counts the scans
+    int inflight = 0;		///< deletes of the last batch not finished
+    bool waiting = false;	///< for those, before the next batch
+  } vpool_purge_state;
+  void vpool_purge_submit(OpContextUPtr&& ctx);
   void snap_trimmer_scrub_complete() override;
   int do_osd_ops(OpContext *ctx, std::vector<OSDOp>& ops);
 

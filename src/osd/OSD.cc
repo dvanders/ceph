@@ -1763,6 +1763,20 @@ void OSDService::queue_recovery_context(
       e));
 }
 
+void OSDService::queue_for_vpool_purge(PG *pg)
+{
+  dout(10) << "queueing " << *pg << " for vpool purge" << dendl;
+  enqueue_back(
+    OpSchedulerItem(
+      unique_ptr<OpSchedulerItem::OpQueueable>(
+	new PGVpoolPurge(pg->get_pgid(), pg->get_osdmap_epoch())),
+      cct->_conf->osd_snap_trim_cost,
+      cct->_conf->osd_snap_trim_priority,
+      ceph_clock_now(),
+      0,
+      pg->get_osdmap_epoch()));
+}
+
 void OSDService::queue_for_snap_trim(PG *pg, uint64_t cost_per_object)
 {
   dout(10) << "queueing " << *pg << " for snaptrim" << dendl;

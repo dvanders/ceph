@@ -5405,6 +5405,231 @@ int PrimaryLogPG::add_trim_to_ctx(
   return 0;
 }
 
+epoch_t PrimaryLogPG::vpool_purge_wanted(std::set<int64_t> *ids) const
+{
+  epoch_t target = 0;
+  for (auto& [id, vp] : get_osdmap()->get_vpools_purging()) {
+    if (vp.first == info.pgid.pool() &&
+	vp.second > info.stats.vpool_purged_epoch) {
+      ids->insert(id);
+      target = std::max(target, vp.second);
+    }
+  }
+  return target;
+}
+
+void PrimaryLogPG::vpool_purge_done(epoch_t epoch, const std::set<int64_t>& ids)
+{
+  ObjectStore::Transaction t;
+  recovery_state.update_stats(
+    [&](auto& history, auto& stats) {
+      for (auto id : ids) {
+	stats.vpool_stats.erase(id);
+      }
+      stats.vpool_purged_epoch = std::max(stats.vpool_purged_epoch, epoch);
+      return true;
+    },
+    &t);
+  int r = osd->store->queue_transaction(ch, std::move(t), nullptr);
+  ceph_assert(r == 0);
+}
+
+void PrimaryLogPG::kick_vpool_purge()
+{
+  if (vpool_purge_state.queued || !is_primary() || !is_active() ||
+      !is_clean() || get_osdmap()->get_vpools_purging().empty()) {
+    return;
+  }
+  std::set<int64_t> ids;
+  if (vpool_purge_wanted(&ids)) {
+    vpool_purge_state.queued = true;
+    osd->queue_for_vpool_purge(this);
+  }
+}
+
+/*
+ * Delete the objects of removed virtual pools. A namespace is spread over
+ * the whole PG, so this lists every object of the PG once, a batch at a
+ * time, and deletes those of the virtual pools that were removed. A PG
+ * whose stats have no entry for them holds none and does not scan.
+ *
+ * The deletes of a batch are submitted together and the next batch is
+ * listed when they have all finished. A clone is removed like the snap
+ * trimmer does it, one of its snaps at a time, and the head after its
+ * clones.
+ */
+void PrimaryLogPG::vpool_purge_submit(OpContextUPtr&& ctx)
+{
+  ++vpool_purge_state.inflight;
+  ctx->register_on_finish(
+    [this, gen = vpool_purge_state.gen]() {
+      auto& ps = vpool_purge_state;
+      if (gen != ps.gen) {
+	return;			// of a scan that was abandoned
+      }
+      if (--ps.inflight == 0 && ps.waiting) {
+	ps.waiting = false;
+	if (!ps.queued) {
+	  ps.queued = true;
+	  osd->queue_for_vpool_purge(this);
+	}
+      }
+    });
+  simple_opc_submit(std::move(ctx));
+}
+
+void PrimaryLogPG::vpool_purge(epoch_t queued)
+{
+  auto& ps = vpool_purge_state;
+  ps.queued = false;
+  if (recovery_state.is_deleting() || pg_has_reset_since(queued) ||
+      !is_primary() || !is_active() || !is_clean()) {
+    ps.scanning = false;	// start again when clean
+    return;
+  }
+  if (!ps.scanning) {
+    ps.ids.clear();
+    ps.target = vpool_purge_wanted(&ps.ids);
+    if (!ps.target) {
+      return;
+    }
+    bool any = false;
+    for (auto id : ps.ids) {
+      any = any || info.stats.vpool_stats.count(id);
+    }
+    if (!any) {
+      dout(10) << __func__ << " nothing of " << ps.ids << " here" << dendl;
+      vpool_purge_done(ps.target, ps.ids);
+      kick_vpool_purge();
+      return;
+    }
+    ps.scanning = true;
+    ++ps.gen;
+    ps.inflight = 0;
+    ps.waiting = false;
+    ps.cursor = hobject_t();
+    ps.scanned = ps.deleted = ps.skipped = 0;
+    ps.start = ceph_clock_now();
+    dout(1) << __func__ << " start, virtual pools " << ps.ids << dendl;
+  }
+  if (ps.inflight > 0) {
+    ps.waiting = true;		// the last of them queues us again
+    return;
+  }
+
+  std::vector<hobject_t> ls;
+  hobject_t next;
+  int r = pgbackend->objects_list_partial(ps.cursor, 64, 128, &ls, &next);
+  if (r < 0) {
+    derr << __func__ << " listing failed: " << cpp_strerror(r) << dendl;
+    ps.scanning = false;
+    return;
+  }
+  bool again = false;		// come back to the object at next
+  for (auto& oid : ls) {
+    if (!ps.ids.count(OSDMap::vpool_from_nspace(oid.nspace))) {
+      ++ps.scanned;
+      continue;
+    }
+    if (is_unreadable_object(oid) ||
+	is_degraded_or_backfilling_object(oid) ||
+	m_scrubber->write_blocked_by_scrub(oid.get_head())) {
+      next = oid;
+      again = true;
+      break;
+    }
+    ObjectContextRef obc = get_object_context(oid, false);
+    if (!obc || !obc->obs.exists) {
+      ++ps.scanned;
+      continue;
+    }
+    if (!oid.is_head()) {
+      // a clone: take one snap off it; without snaps it is deleted
+      size_t snaps = 0;
+      snapid_t snap;
+      if (obc->ssc) {
+	auto ci = obc->ssc->snapset.clone_snaps.find(oid.snap);
+	if (ci != obc->ssc->snapset.clone_snaps.end() && !ci->second.empty()) {
+	  snaps = ci->second.size();
+	  snap = ci->second.front();
+	}
+      }
+      if (!snaps) {
+	++ps.scanned;
+	++ps.skipped;
+	continue;
+      }
+      OpContextUPtr ctx;
+      r = trim_object(true, oid, snap, &ctx);
+      if (r == -ENOLCK) {
+	next = oid;
+	again = true;
+	break;
+      }
+      if (r < 0) {
+	++ps.scanned;
+	++ps.skipped;
+	continue;
+      }
+      vpool_purge_submit(std::move(ctx));
+      if (snaps > 1) {
+	next = oid;
+	again = true;
+	break;
+      }
+      ++ps.scanned;
+      ++ps.deleted;
+      continue;
+    }
+    if (obc->obs.oi.is_whiteout()) {
+      ++ps.scanned;		// goes with its last clone
+      continue;
+    }
+    if (obc->ssc && !obc->ssc->snapset.clones.empty()) {
+      ++ps.scanned;
+      ++ps.skipped;		// its clones could not be removed
+      continue;
+    }
+    OpContextUPtr ctx = simple_opc_create(obc);
+    auto null_op_req = OpRequestRef();
+    if (!ctx->lock_manager.get_lock_type(
+	  RWState::RWWRITE, oid, obc, null_op_req)) {
+      close_op_ctx(ctx.release());
+      next = oid;
+      again = true;
+      break;
+    }
+    ctx->at_version = get_next_version();
+    r = _delete_oid(ctx.get(), true, false);
+    ceph_assert(r == 0);
+    if (obc->obs.oi.is_omap())
+      ctx->delta_stats.num_objects_omap--;
+    if (obc->obs.oi.is_dirty())
+      --ctx->delta_stats.num_objects_dirty;
+    finish_ctx(ctx.get(), pg_log_entry_t::DELETE);
+    vpool_purge_submit(std::move(ctx));
+    ++ps.scanned;
+    ++ps.deleted;
+  }
+  ps.cursor = next;
+  if (ps.inflight > 0) {
+    ps.waiting = true;
+    return;
+  }
+  if (!again && next.is_max()) {
+    dout(1) << __func__ << " done, virtual pools " << ps.ids
+	    << ": scanned " << ps.scanned << " deleted " << ps.deleted
+	    << " skipped (snapshots) " << ps.skipped
+	    << " in " << (ceph_clock_now() - ps.start) << dendl;
+    ps.scanning = false;
+    vpool_purge_done(ps.target, ps.ids);
+    kick_vpool_purge();		// more were removed meanwhile?
+    return;
+  }
+  ps.queued = true;
+  osd->queue_for_vpool_purge(this);
+}
+
 void PrimaryLogPG::kick_snap_trim()
 {
   ceph_assert(is_active());

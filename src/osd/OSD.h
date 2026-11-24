@@ -528,6 +528,7 @@ public:
                               uint64_t cost,
 			      int priority);
   void queue_for_snap_trim(PG *pg, uint64_t cost);
+  void queue_for_vpool_purge(PG *pg);
   void queue_for_scrub(PG* pg, Scrub::scrub_prio_t with_priority);
 
   /// Signals either (a) the end of a sleep period, or (b) a recheck of the availability

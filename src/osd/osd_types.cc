@@ -3357,6 +3357,7 @@ void pg_stat_t::dump(Formatter *f) const
     f->close_section();
   }
   f->close_section();
+  f->dump_unsigned("vpool_purged_epoch", vpool_purged_epoch);
   f->open_array_section("vpool_stats");
   for (auto& [id, st] : vpool_stats) {
     f->open_object_section("vpool");
@@ -3509,6 +3510,7 @@ void pg_stat_t::encode(ceph::buffer::list &bl) const
   encode(scrub_sched_status.m_num_to_reserve, bl);
   encode(last_degraded, bl);
   encode(vpool_stats, bl);
+  encode(vpool_purged_epoch, bl);
 
   ENCODE_FINISH(bl);
 }
@@ -3626,6 +3628,7 @@ void pg_stat_t::decode(ceph::buffer::list::const_iterator &bl)
     }
     if (struct_v >= 32) {
       decode(vpool_stats, bl);
+      decode(vpool_purged_epoch, bl);
     }
   }
   DECODE_FINISH(bl);
@@ -3751,7 +3754,8 @@ bool operator==(const pg_stat_t& l, const pg_stat_t& r)
     l.objects_trimmed == r.objects_trimmed &&
     l.snaptrim_duration == r.snaptrim_duration &&
     l.last_degraded == r.last_degraded &&
-    l.vpool_stats == r.vpool_stats;
+    l.vpool_stats == r.vpool_stats &&
+    l.vpool_purged_epoch == r.vpool_purged_epoch;
 }
 
 // -- store_statfs_t --

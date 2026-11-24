@@ -49,6 +49,16 @@ void PGSnapTrim::run(
   pg->unlock();
 }
 
+void PGVpoolPurge::run(
+  OSD *osd,
+  OSDShard *sdata,
+  PGRef& pg,
+  ThreadPool::TPHandle &handle)
+{
+  pg->vpool_purge(epoch_queued);
+  pg->unlock();
+}
+
 void PGScrub::run(OSD* osd, OSDShard* sdata, PGRef& pg, ThreadPool::TPHandle& handle)
 {
   pg->scrub(epoch_queued, handle);

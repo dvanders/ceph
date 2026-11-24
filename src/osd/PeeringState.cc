@@ -4194,7 +4194,10 @@ void PeeringState::split_into(
   child->info.stats = info.stats;
   // the parent keeps what it counted for virtual pools; only the sum over
   // PGs is used
-  child->info.stats.vpool_stats.clear();
+  for (auto& [id, st] : child->info.stats.vpool_stats) {
+    // keep the entry: it says the PG may hold objects of that virtual pool
+    st = {0, 0};
+  }
   child->info.stats.parent_split_bits = split_bits;
   info.stats.stats_invalid = true;
   child->info.stats.stats_invalid = true;
@@ -4323,6 +4326,8 @@ void PeeringState::merge_from(
 
     // combine stats
     info.stats.add(source->info.stats);
+    info.stats.vpool_purged_epoch = std::min(
+      info.stats.vpool_purged_epoch, source->info.stats.vpool_purged_epoch);
 
     // pull up last_update
     info.last_update = std::max(info.last_update, source->info.last_update);
@@ -5675,7 +5680,7 @@ void PeeringState::apply_op_stats(
   info.stats.stats.floor(0);
 
   if (int64_t vpool = OSDMap::vpool_from_nspace(soid.nspace);
-      vpool >= 0 && get_osdmap()->get_vpool_base(vpool) == info.pgid.pool()) {
+      vpool >= 0 && get_osdmap()->get_vpool_base_any(vpool) == info.pgid.pool()) {
     auto& st = info.stats.vpool_stats[vpool];
     st.first += delta_stats.num_objects;
     st.second += delta_stats.num_bytes;

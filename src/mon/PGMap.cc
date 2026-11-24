@@ -87,6 +87,7 @@ void PGMapDigest::encode(bufferlist& bl, uint64_t features) const
   encode(osd_sum_by_class, bl, features);
   encode(pool_pg_unavailable_map, bl);
   encode(vpool_sum, bl);
+  encode(vpool_purged_epoch, bl);
   ENCODE_FINISH(bl);
 }
 
@@ -117,6 +118,7 @@ void PGMapDigest::decode(bufferlist::const_iterator& p)
   }
   if (struct_v >= 6) {
     decode(vpool_sum, p);
+    decode(vpool_purged_epoch, p);
   }
   DECODE_FINISH(p);
 }
@@ -1682,6 +1684,26 @@ void PGMap::encode_digest(const OSDMap& osdmap,
   calc_osd_sum_by_class(osdmap);
   calc_purged_snaps();
   get_unavailable_pg_in_pool_map(osdmap);
+  // how far the PGs of each base pool are with purging removed virtual pools
+  vpool_purged_epoch.clear();
+  if (!osdmap.get_vpools_purging().empty()) {
+    std::map<int64_t, std::pair<unsigned, epoch_t>> seen;  // pool -> (pgs, min)
+    for (auto& [id, vp] : osdmap.get_vpools_purging()) {
+      seen[vp.first] = {0, std::numeric_limits<epoch_t>::max()};
+    }
+    for (auto& [pgid, st] : pg_stat) {
+      if (auto p = seen.find(pgid.pool()); p != seen.end()) {
+	++p->second.first;
+	p->second.second = std::min(p->second.second, st.vpool_purged_epoch);
+      }
+    }
+    for (auto& [pool, s] : seen) {
+      auto pi = osdmap.get_pg_pool(pool);
+      if (pi && s.first == pi->get_pg_num()) {
+	vpool_purged_epoch[pool] = s.second;
+      }
+    }
+  }
   PGMapDigest::encode(bl, features);
 }
 
