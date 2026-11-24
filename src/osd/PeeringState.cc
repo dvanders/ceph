@@ -4192,6 +4192,9 @@ void PeeringState::split_into(
   }
 
   child->info.stats = info.stats;
+  // the parent keeps what it counted for virtual pools; only the sum over
+  // PGs is used
+  child->info.stats.vpool_stats.clear();
   child->info.stats.parent_split_bits = split_bits;
   info.stats.stats_invalid = true;
   child->info.stats.stats_invalid = true;
@@ -5670,6 +5673,13 @@ void PeeringState::apply_op_stats(
 	     << dendl;
   info.stats.stats.add(delta_stats);
   info.stats.stats.floor(0);
+
+  if (int64_t vpool = OSDMap::vpool_from_nspace(soid.nspace);
+      vpool >= 0 && get_osdmap()->get_vpool_base(vpool) == info.pgid.pool()) {
+    auto& st = info.stats.vpool_stats[vpool];
+    st.first += delta_stats.num_objects;
+    st.second += delta_stats.num_bytes;
+  }
 
   for (auto i = get_backfill_targets().begin();
        i != get_backfill_targets().end();

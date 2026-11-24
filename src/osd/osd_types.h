@@ -2450,6 +2450,19 @@ struct pg_stat_t {
 
   pg_scrubbing_status_t scrub_sched_status;
 
+  /// usage of each virtual pool in this PG: id -> (objects, bytes).
+  /// Signed and not floored: after a split a PG may account for deletes of
+  /// objects that its parent counted; only the sum over PGs means something.
+  std::map<int64_t, std::pair<int64_t, int64_t>> vpool_stats;
+
+  void add_vpool_stats(const pg_stat_t& o, int sign) {
+    for (auto& [id, st] : o.vpool_stats) {
+      auto& mine = vpool_stats[id];
+      mine.first += sign * st.first;
+      mine.second += sign * st.second;
+    }
+  }
+
   bool stats_invalid:1;
   /// true if num_objects_dirty is not accurate (because it was not
   /// maintained starting from pool creation)
@@ -2526,6 +2539,7 @@ struct pg_stat_t {
     ondisk_log_size += o.ondisk_log_size;
     snaptrimq_len = std::min((uint64_t)snaptrimq_len + o.snaptrimq_len,
                              (uint64_t)(1ull << 31));
+    add_vpool_stats(o, 1);
     add_sub_invalid_flags(o);
   }
   void sub(const pg_stat_t& o) {
@@ -2538,6 +2552,7 @@ struct pg_stat_t {
     } else {
       snaptrimq_len = 0;
     }
+    add_vpool_stats(o, -1);
     add_sub_invalid_flags(o);
   }
 

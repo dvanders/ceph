@@ -64,7 +64,7 @@ PGMapDigest::~PGMapDigest() noexcept = default;
 void PGMapDigest::encode(bufferlist& bl, uint64_t features) const
 {
   // NOTE: see PGMap::encode_digest
-  uint8_t v = 5;
+  uint8_t v = 6;
   ceph_assert(HAVE_FEATURE(features, SERVER_NAUTILUS));
   ENCODE_START(v, 1, bl);
   encode(num_pg, bl);
@@ -86,12 +86,13 @@ void PGMapDigest::encode(bufferlist& bl, uint64_t features) const
   encode(purged_snaps, bl);
   encode(osd_sum_by_class, bl, features);
   encode(pool_pg_unavailable_map, bl);
+  encode(vpool_sum, bl);
   ENCODE_FINISH(bl);
 }
 
 void PGMapDigest::decode(bufferlist::const_iterator& p)
 {
-  DECODE_START(5, p);
+  DECODE_START(6, p);
   ceph_assert(struct_v >= 4);
   decode(num_pg, p);
   decode(num_pg_active, p);
@@ -113,6 +114,9 @@ void PGMapDigest::decode(bufferlist::const_iterator& p)
   decode(osd_sum_by_class, p);
   if (struct_v >= 5) {
     decode(pool_pg_unavailable_map, p);
+  }
+  if (struct_v >= 6) {
+    decode(vpool_sum, p);
   }
   DECODE_FINISH(p);
 }
@@ -890,6 +894,51 @@ void PGMapDigest::dump_pool_stats_full(
       tbl << TextTable::endrow;
     }
   }
+  // virtual pools: what the PGs of the base pool counted for them
+  for (auto& [vpool_id, vp] : osd_map.get_vpools()) {
+    const pg_pool_t *base = osd_map.get_pg_pool(vp.first);
+    if (!base)
+      continue;
+    int64_t objects = 0, stored = 0;
+    if (auto q = vpool_sum.find(vpool_id); q != vpool_sum.end()) {
+      objects = std::max<int64_t>(q->second.first, 0);
+      stored = std::max<int64_t>(q->second.second, 0);
+    }
+    float raw_used_rate = osd_map.pool_raw_used_rate(vp.first);
+    int64_t avail = get_rule_avail(base->get_crush_rule());
+    if (avail < 0)
+      avail = 0;
+    uint64_t used = stored * raw_used_rate;
+    uint64_t max_avail = raw_used_rate > 0 ? avail / raw_used_rate : 0;
+    float used_frac = (used + avail) > 0 ? (float)used / (used + avail) : 0;
+    if (f) {
+      f->open_object_section("pool");
+      f->dump_string("name", vp.second);
+      f->dump_int("id", vpool_id);
+      f->dump_int("base_pool", vp.first);
+      f->open_object_section("stats");
+      f->dump_int("stored", stored);
+      f->dump_int("objects", objects);
+      f->dump_int("bytes_used", used);
+      f->dump_float("percent_used", used_frac);
+      f->dump_unsigned("max_avail", max_avail);
+      f->close_section();
+      f->close_section();
+    } else {
+      tbl << vp.second << vpool_id
+	  << ("(" + osd_map.get_pool_name(vp.first) + ")")
+	  << stringify(byte_u_t(stored));
+      if (verbose)
+	tbl << "-" << "-";
+      tbl << stringify(si_u_t(objects)) << stringify(byte_u_t(used));
+      if (verbose)
+	tbl << "-" << "-";
+      tbl << percentify(used_frac * 100) << stringify(byte_u_t(max_avail));
+      if (verbose)
+	tbl << "-" << "-" << "-" << "-" << "-";
+      tbl << TextTable::endrow;
+    }
+  }
   if (f)
     f->close_section();
   else {
@@ -1401,6 +1450,7 @@ void PGMap::calc_stats()
   num_pg_unknown = 0;
   num_osd = 0;
   pg_pool_sum.clear();
+  vpool_sum.clear();
   num_pg_by_pool.clear();
   pg_by_osd.clear();
   pg_sum = pool_stat_t();
@@ -1434,6 +1484,11 @@ void PGMap::stat_pg_add(const pg_t &pgid, const pg_stat_t &s,
 {
   auto pool = pgid.pool();
   pg_sum.add(s);
+  for (auto& [id, st] : s.vpool_stats) {
+    auto& sum = vpool_sum[id];
+    sum.first += st.first;
+    sum.second += st.second;
+  }
 
   num_pg++;
   num_pg_by_state[s.state]++;
@@ -1486,6 +1541,11 @@ bool PGMap::stat_pg_sub(const pg_t &pgid, const pg_stat_t &s,
 {
   bool pool_erased = false;
   pg_sum.sub(s);
+  for (auto& [id, st] : s.vpool_stats) {
+    auto& sum = vpool_sum[id];
+    sum.first -= st.first;
+    sum.second -= st.second;
+  }
 
   num_pg--;
   int end = --num_pg_by_state[s.state];

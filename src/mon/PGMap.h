@@ -58,6 +58,8 @@ public:
   int64_t num_pg_active = 0;
   int64_t num_pg_unknown = 0;
   mempool::pgmap::unordered_map<int32_t,pool_stat_t> pg_pool_sum;
+  /// usage of virtual pools: id -> (objects, bytes), summed over PGs
+  std::map<int64_t, std::pair<int64_t, int64_t>> vpool_sum;
   mempool::pgmap::map<int64_t,int64_t> num_pg_by_pool;
   pool_stat_t pg_sum;
   osd_stat_t osd_sum;

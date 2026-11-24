@@ -3357,6 +3357,15 @@ void pg_stat_t::dump(Formatter *f) const
     f->close_section();
   }
   f->close_section();
+  f->open_array_section("vpool_stats");
+  for (auto& [id, st] : vpool_stats) {
+    f->open_object_section("vpool");
+    f->dump_int("id", id);
+    f->dump_int("num_objects", st.first);
+    f->dump_int("num_bytes", st.second);
+    f->close_section();
+  }
+  f->close_section();
 }
 
 void pg_stat_t::dump_brief(Formatter *f) const
@@ -3435,7 +3444,7 @@ bool operator==(const pg_scrubbing_status_t& l, const pg_scrubbing_status_t& r)
 
 void pg_stat_t::encode(ceph::buffer::list &bl) const
 {
-  ENCODE_START(31, 22, bl);
+  ENCODE_START(32, 22, bl);
   encode(version, bl);
   encode(reported_seq, bl);
   encode(reported_epoch, bl);
@@ -3499,6 +3508,7 @@ void pg_stat_t::encode(ceph::buffer::list &bl) const
   encode(scrub_sched_status.m_ordinal_of_requested_replica, bl);
   encode(scrub_sched_status.m_num_to_reserve, bl);
   encode(last_degraded, bl);
+  encode(vpool_stats, bl);
 
   ENCODE_FINISH(bl);
 }
@@ -3507,7 +3517,7 @@ void pg_stat_t::decode(ceph::buffer::list::const_iterator &bl)
 {
   bool tmp;
   uint32_t old_state;
-  DECODE_START(31, bl);
+  DECODE_START(32, bl);
   decode(version, bl);
   decode(reported_seq, bl);
   decode(reported_epoch, bl);
@@ -3613,6 +3623,9 @@ void pg_stat_t::decode(ceph::buffer::list::const_iterator &bl)
       decode(last_degraded, bl);
     } else {
       last_degraded = last_clean;
+    }
+    if (struct_v >= 32) {
+      decode(vpool_stats, bl);
     }
   }
   DECODE_FINISH(bl);
@@ -3737,7 +3750,8 @@ bool operator==(const pg_stat_t& l, const pg_stat_t& r)
     l.scrub_duration == r.scrub_duration &&
     l.objects_trimmed == r.objects_trimmed &&
     l.snaptrim_duration == r.snaptrim_duration &&
-    l.last_degraded == r.last_degraded;
+    l.last_degraded == r.last_degraded &&
+    l.vpool_stats == r.vpool_stats;
 }
 
 // -- store_statfs_t --

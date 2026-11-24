@@ -1282,6 +1282,22 @@ public:
   static std::string vpool_nspace_prefix(int64_t id) {
     return "vpool." + std::to_string(id) + "/";
   }
+  /// the virtual pool a namespace belongs to by its prefix, or -1
+  static int64_t vpool_from_nspace(std::string_view nspace) {
+    constexpr std::string_view pre = "vpool.";
+    if (nspace.size() <= pre.size() || nspace.substr(0, pre.size()) != pre)
+      return -1;
+    int64_t id = 0;
+    size_t i = pre.size();
+    for (; i < nspace.size() && nspace[i] >= '0' && nspace[i] <= '9'; ++i) {
+      id = id * 10 + (nspace[i] - '0');
+      if (id < 0)
+	return -1;
+    }
+    if (i == pre.size() || i >= nspace.size() || nspace[i] != '/')
+      return -1;
+    return id;
+  }
   /// the pool that holds the objects: the base pool for a virtual pool
   int64_t get_data_pool(int64_t id) const {
     int64_t base = get_vpool_base(id);
